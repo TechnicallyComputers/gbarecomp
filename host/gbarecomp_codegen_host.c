@@ -1082,19 +1082,97 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
 #endif
 }
 
+static int write_line_file(const char* path, const char* line) {
+    FILE* f;
+    if (!path || !path[0] || !line || !line[0])
+        return 0;
+    f = fopen(path, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "%s\n", line);
+    fclose(f);
+    return 1;
+}
+
+static int read_line_file(const char* path, char* out, size_t cap) {
+    FILE* f;
+    size_t n;
+    if (!path || !path[0] || !out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (!fgets(out, (int)cap, f)) {
+        fclose(f);
+        out[0] = '\0';
+        return 0;
+    }
+    fclose(f);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' ||
+                     out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+    return out[0] != '\0';
+}
+
+/* Sidecars are loaded next to argv[0] (see launcher_seam state_path). The
+ * setup host often lives at the zip root while the rebuilt binary is under
+ * build/ — write beside the game binary, not only cwd. */
+static void write_sidecar_near_exe(const char* near_exe, const char* name,
+                                   const char* value) {
+    char dir[1100], path[1200];
+    if (!near_exe || !near_exe[0] || !name || !name[0] || !value || !value[0])
+        return;
+    if (!dirname_copy(dir, sizeof(dir), near_exe))
+        return;
+    if (!join_path(path, sizeof(path), dir, name))
+        return;
+    write_line_file(path, value);
+}
+
+static void persist_relaunch_sidecars(const char* near_exe,
+                                      const char* rom_path) {
+    char bios_line[1024];
+    char project_sidecar[1200];
+
+    if (rom_path && rom_path[0]) {
+        write_sidecar_near_exe(near_exe, "rom.cfg", rom_path);
+        write_line_file("rom.cfg", rom_path);
+        if (g_project_root[0] &&
+            join_path(project_sidecar, sizeof(project_sidecar), g_project_root,
+                      "rom.cfg"))
+            write_line_file(project_sidecar, rom_path);
+    }
+
+    bios_line[0] = '\0';
+    if (!read_line_file("bios.cfg", bios_line, sizeof(bios_line)) &&
+        g_project_root[0] &&
+        join_path(project_sidecar, sizeof(project_sidecar), g_project_root,
+                  "bios.cfg"))
+        read_line_file(project_sidecar, bios_line, sizeof(bios_line));
+    if ((!bios_line[0] || !path_is_file(bios_line)) && g_has_bios && g_bios[0])
+        snprintf(bios_line, sizeof(bios_line), "%s", g_bios);
+    if (bios_line[0]) {
+        write_sidecar_near_exe(near_exe, "bios.cfg", bios_line);
+        write_line_file("bios.cfg", bios_line);
+        if (g_project_root[0] &&
+            join_path(project_sidecar, sizeof(project_sidecar), g_project_root,
+                      "bios.cfg"))
+            write_line_file(project_sidecar, bios_line);
+    }
+}
+
 void gbarecomp_codegen_host_relaunch_or_exit(const char* rom_path) {
     char exe[512];
+    const char* near_exe;
     if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
         fprintf(stderr, "gbarecomp-codegen: relaunch requested but no path\n");
         exit(1);
     }
-    if (rom_path && rom_path[0]) {
-        FILE* rc = fopen("rom.cfg", "w");
-        if (rc) {
-            fprintf(rc, "%s\n", rom_path);
-            fclose(rc);
-        }
-    }
+    /* Prefer the final game binary (build/<exe>) over a Windows helper bat. */
+    near_exe = g_exe_path[0] ? g_exe_path : exe;
+    persist_relaunch_sidecars(near_exe, rom_path);
 
 #if defined(_WIN32)
     {
@@ -1125,6 +1203,10 @@ void gbarecomp_codegen_host_relaunch_or_exit(const char* rom_path) {
     }
 #else
     {
+        if (g_project_root[0] && chdir(g_project_root) != 0) {
+            fprintf(stderr, "gbarecomp-codegen: chdir(%s) failed: %s\n",
+                    g_project_root, strerror(errno));
+        }
         fprintf(stderr, "gbarecomp-codegen: relaunching %s\n", exe);
         char* args[] = { exe, "--launcher", NULL };
         execv(exe, args);

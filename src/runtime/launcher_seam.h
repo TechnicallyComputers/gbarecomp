@@ -805,11 +805,38 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
                                         seed_rom.c_str(),
                                         picked_rom, sizeof(picked_rom));
     if (rc == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
-        // Persist the ROM pick so the rebuilt binary prefills the launcher.
-        if (picked_rom[0])
-            write_single_line(rom_cfg, picked_rom);
-        if (ls.bios_path[0])
-            write_single_line(bios_cfg, ls.bios_path);
+        // Persist ROM/BIOS for the next process. The setup host and the rebuilt
+        // binary often live in different directories (zip-root vs build/), and
+        // state_path() is always next to argv[0] — so write beside both the
+        // current exe and the relaunch target.
+        auto persist_rom_bios = [&](const std::string& rom_path,
+                                    const std::string& bios_path) {
+            if (picked_rom[0])
+                write_single_line(rom_path, picked_rom);
+            if (ls.bios_path[0])
+                write_single_line(bios_path, ls.bios_path);
+        };
+        persist_rom_bios(rom_cfg, bios_cfg);
+        char relaunch_exe[512] = {};
+        if (recomp_launcher_relaunch_exe(relaunch_exe, sizeof(relaunch_exe)) &&
+            relaunch_exe[0]) {
+            const std::filesystem::path rdir =
+                std::filesystem::path(relaunch_exe).parent_path();
+            if (!rdir.empty() && rdir != std::filesystem::path(dir)) {
+                const char* rom_name =
+                    (opts.launcher_rom_cache_filename &&
+                     opts.launcher_rom_cache_filename[0])
+                        ? opts.launcher_rom_cache_filename
+                        : "rom.cfg";
+                const char* bios_name =
+                    (opts.launcher_bios_cache_filename &&
+                     opts.launcher_bios_cache_filename[0])
+                        ? opts.launcher_bios_cache_filename
+                        : "bios.cfg";
+                persist_rom_bios((rdir / rom_name).string(),
+                                 (rdir / bios_name).string());
+            }
+        }
         if (opts.launcher_codegen_relaunch)
             opts.launcher_codegen_relaunch(picked_rom[0] ? picked_rom : nullptr);
         // Host should not return; if it does, treat as quit.
