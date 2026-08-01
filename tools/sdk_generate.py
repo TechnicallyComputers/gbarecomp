@@ -563,6 +563,15 @@ def rebuild_command(args: argparse.Namespace, progress: ProgressReporter) -> int
         progress.error("cmake not found on PATH (set CMAKE=...)", code=EXIT_ERROR)
         return EXIT_ERROR
 
+    # Chrome " (1)" renames and similar break some Ninja POST_BUILD shell lines.
+    root_s = str(project_root)
+    if any(ch in root_s for ch in ("(", ")", "\n", "'")):
+        progress.log(
+            f"warning: project path contains shell-special characters: {project_root}. "
+            "If the link step fails with \"syntax error near unexpected token\", "
+            "rename/move the extract to a path without parentheses or spaces."
+        )
+
     cmake_extra: list[str] = []
     for extra in getattr(args, "cmake_arg", None) or []:
         if extra:
