@@ -165,6 +165,15 @@ struct RunOptions {
     // null => the launcher's default "assets/img/boxart.tga". Multi-variant
     // repos stage one file per variant (e.g. "assets/img/boxart_firered.tga").
     const char* launcher_boxart = nullptr;
+
+    // Optional Local Codegen SDK host (recomp-ui setup wizard). Typed as
+    // void* so runtime.h stays free of recomp_launcher.h. When set, the
+    // launcher seam applies the host to RecompLauncherCGameInfo before
+    // run_window, and on RECOMP_LAUNCHER_RESULT_RELAUNCH calls
+    // launcher_codegen_relaunch (must not return on success).
+    void (*launcher_codegen_setup)(void* game_info /* RecompLauncherCGameInfo* */) =
+        nullptr;
+    void (*launcher_codegen_relaunch)(const char* rom_path) = nullptr;
 };
 
 int run_game(int argc, char** argv, const RunOptions& opts = {});

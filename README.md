@@ -50,6 +50,25 @@ If you already have a game TOML or imported symbol file, add `--config` or
 
 GBARecomp does not include a GBA BIOS or game ROMs.
 
+### Local codegen SDK (RetComM / recomp-ui)
+
+Existing game ports regenerate sources with the headless SDK (same contract as
+snesrecomp / psxrecomp):
+
+```bash
+python gbarecomp_cli.py verify-rom --rom GAME.gba --expected-sha1 <40-hex>
+python gbarecomp_cli.py generate \
+  --rom GAME.gba \
+  --config variants/<game>/symbols/<region>.toml \
+  --out-dir variants/<game>/generated \
+  --project-root /path/to/GameRecomp \
+  [--bios path/to/gba_bios.bin] --json-progress
+```
+
+See [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) for exit codes,
+JSONL progress, the portable `host/gbarecomp_codegen_host.*` wizard glue, and
+setup-host CMake (`-DGBARECOMP_ALLOW_NO_GENERATED=ON`).
+
 ---
 
 ## Game targets
@@ -74,9 +93,11 @@ Pokémon repos cover **five games** between them:
 | `src/gba/`    | GBA-specific bus, IO, IRQ, DMA, timers, PPU, audio, input, save, BIOS.  |
 | `src/runtime/`| Linkable runtime: dispatch, host platform glue, generated-code support. |
 | `src/debug/`  | TCP debug server, always-on ring buffers, snapshot/save-state.          |
-| `tools/`      | `gba_scan`, `gba_recompile`, `symbol_import`, `test_rom_runner`.        |
+| `tools/`      | `gba_scan`, `gba_recompile`, `symbol_import`, SDK helpers, `test_rom_runner`. |
+| `host/`       | Portable recomp-ui codegen host (`generate` → rebuild → relaunch).      |
+| `gbarecomp_cli.py` | Headless verify-rom / generate / rebuild SDK entry (RetComM).       |
 | `tests/`      | Per-subsystem tests (decoder, bus, DMA, timers, IRQ, PPU smoke).        |
-| `docs/`       | Architecture, GBA reference inventory, debugging, roadmap.              |
+| `docs/`       | Architecture, Local Codegen SDK, GBA reference, debugging, roadmap.     |
 | `third_party/`| External libs (see `third_party/README.md` for licenses).               |
 
 ---

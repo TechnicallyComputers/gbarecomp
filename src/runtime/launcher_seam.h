@@ -795,14 +795,29 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     }
     if (!save_display.empty()) gi.sram_path = save_display.c_str();
 
+    if (opts.launcher_codegen_setup)
+        opts.launcher_codegen_setup(&gi);
+
     std::string title = std::string(gi.name) + " \xE2\x80\x94 Launcher";
 
     char picked_rom[1024] = {0};
     int rc = recomp_launcher_run_window(title.c_str(), &ls, &gi, dir.c_str(),
                                         seed_rom.c_str(),
                                         picked_rom, sizeof(picked_rom));
-    if (rc == 1) return 1;    // user closed the launcher: quit without booting
-    if (rc != 0) return 0;    // unavailable: fall back to the asset picker
+    if (rc == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
+        // Persist the ROM pick so the rebuilt binary prefills the launcher.
+        if (picked_rom[0])
+            write_single_line(rom_cfg, picked_rom);
+        if (ls.bios_path[0])
+            write_single_line(bios_cfg, ls.bios_path);
+        if (opts.launcher_codegen_relaunch)
+            opts.launcher_codegen_relaunch(picked_rom[0] ? picked_rom : nullptr);
+        // Host should not return; if it does, treat as quit.
+        return 1;
+    }
+    if (rc == RECOMP_LAUNCHER_RESULT_QUIT) return 1;  // quit without booting
+    if (rc != RECOMP_LAUNCHER_RESULT_LAUNCH)
+        return 0;  // unavailable: fall back to the asset picker
 
     // ---- persist + translate the committed settings -------------------------
     cfg.scale         = ls.window_scale > 0 ? ls.window_scale : cfg.scale;

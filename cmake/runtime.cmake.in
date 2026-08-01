@@ -19,6 +19,11 @@
 set(GBARECOMP_CORE_DIR "@CMAKE_CURRENT_SOURCE_DIR@" CACHE PATH "")
 set(GBARECOMP_CORE_BIN_DIR "@CMAKE_CURRENT_BINARY_DIR@" CACHE PATH "")
 
+# Setup-host builds may configure before the user has run generate.
+option(GBARECOMP_ALLOW_NO_GENERATED
+    "Allow gbarecomp_add_runtime_target without cart shards (setup host)"
+    OFF)
+
 function(gbarecomp_add_runtime_target target_name)
     cmake_parse_arguments(GR
         ""
@@ -39,17 +44,25 @@ function(gbarecomp_add_runtime_target target_name)
             "${GR_GAME_GENERATED_DIR}/recompiled_[0-9][0-9][0-9].cpp")
         list(LENGTH _gbarecomp_shards _gbarecomp_shard_count)
         if(_gbarecomp_shard_count LESS 2)
-            message(FATAL_ERROR
-                "gbarecomp_add_runtime_target(${target_name}): expected at "
-                "least two recompiled_NNN.cpp files in "
-                "${GR_GAME_GENERATED_DIR}; regenerate the cartridge.")
-        endif()
-        list(APPEND GR_GAME_GENERATED_C
-            ${_gbarecomp_shards}
-            "${GR_GAME_GENERATED_DIR}/dispatch_table.cpp")
-        if(EXISTS "${GR_GAME_GENERATED_DIR}/symbol_map.cpp")
+            if(GBARECOMP_ALLOW_NO_GENERATED)
+                message(STATUS
+                    "gbarecomp_add_runtime_target(${target_name}): no cart "
+                    "shards yet (GBARECOMP_ALLOW_NO_GENERATED=ON) — setup host")
+            else()
+                message(FATAL_ERROR
+                    "gbarecomp_add_runtime_target(${target_name}): expected at "
+                    "least two recompiled_NNN.cpp files in "
+                    "${GR_GAME_GENERATED_DIR}; regenerate the cartridge, or "
+                    "configure a setup host with -DGBARECOMP_ALLOW_NO_GENERATED=ON.")
+            endif()
+        else()
             list(APPEND GR_GAME_GENERATED_C
-                "${GR_GAME_GENERATED_DIR}/symbol_map.cpp")
+                ${_gbarecomp_shards}
+                "${GR_GAME_GENERATED_DIR}/dispatch_table.cpp")
+            if(EXISTS "${GR_GAME_GENERATED_DIR}/symbol_map.cpp")
+                list(APPEND GR_GAME_GENERATED_C
+                    "${GR_GAME_GENERATED_DIR}/symbol_map.cpp")
+            endif()
         endif()
     endif()
 
@@ -63,8 +76,20 @@ function(gbarecomp_add_runtime_target target_name)
     endforeach()
 
     if(NOT GR_GAME_GENERATED_C)
-        message(FATAL_ERROR "gbarecomp_add_runtime_target(${target_name}): "
-            "missing GAME_GENERATED_DIR or GAME_GENERATED_C")
+        if(GBARECOMP_ALLOW_NO_GENERATED)
+            message(STATUS
+                "gbarecomp_add_runtime_target(${target_name}): empty generated "
+                "set (setup host) — using placeholder TU")
+            set(_gbarecomp_setup_stub
+                "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_setup_stub.cpp")
+            file(WRITE "${_gbarecomp_setup_stub}"
+                "/* setup-host placeholder; replaced after gbarecomp_cli.py generate */\n"
+                "typedef int gbarecomp_setup_host_placeholder;\n")
+            list(APPEND GR_GAME_GENERATED_C "${_gbarecomp_setup_stub}")
+        else()
+            message(FATAL_ERROR "gbarecomp_add_runtime_target(${target_name}): "
+                "missing GAME_GENERATED_DIR or GAME_GENERATED_C")
+        endif()
     endif()
 
     add_executable(${target_name}
