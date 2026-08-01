@@ -139,28 +139,29 @@ static int find_python(char* out, size_t cap) {
     return 0;
 }
 
-static int resolve_toolchain_bin(char* out, size_t cap) {
-    char cand[1100], cmake[1200];
-    if (!g_project_root[0])
-        return 0;
-    if (!join_path(cand, sizeof(cand), g_project_root, "toolchain/bin"))
-        return 0;
+static int toolchain_bin_has_cmake(const char* bin, char* out, size_t cap) {
+    char cmake[1200];
 #if defined(_WIN32)
-    if (join_path(cmake, sizeof(cmake), cand, "cmake.exe") && path_is_file(cmake)) {
-        snprintf(out, cap, "%s", cand);
+    if (join_path(cmake, sizeof(cmake), bin, "cmake.exe") && path_is_file(cmake)) {
+        snprintf(out, cap, "%s", bin);
         return 1;
     }
 #else
-    if (join_path(cmake, sizeof(cmake), cand, "cmake") && path_is_file(cmake)) {
-        snprintf(out, cap, "%s", cand);
+    if (join_path(cmake, sizeof(cmake), bin, "cmake") && path_is_file(cmake)) {
+        snprintf(out, cap, "%s", bin);
         return 1;
     }
 #endif
-    char wrap[1100];
-    if (!join_path(wrap, sizeof(wrap), g_project_root, "toolchain"))
+    return 0;
+}
+
+static int resolve_toolchain_bin_under(const char* wrap, char* out, size_t cap) {
+    char cand[1100], cmake[1200];
+    if (!wrap || !wrap[0] || !path_is_dir(wrap))
         return 0;
-    if (!path_is_dir(wrap))
-        return 0;
+    if (join_path(cand, sizeof(cand), wrap, "bin") &&
+        toolchain_bin_has_cmake(cand, out, cap))
+        return 1;
 #if defined(_WIN32)
     WIN32_FIND_DATAA fd;
     char pattern[1200];
@@ -212,6 +213,58 @@ static int resolve_toolchain_bin(char* out, size_t cap) {
     closedir(dir);
     return found;
 #endif
+}
+
+/* Probe RetComM / gbarecomp shared caches (cmake-clang-v1 modular pack). */
+static int resolve_shared_toolchain_bin(char* out, size_t cap) {
+    char bases[4][1100];
+    int n = 0;
+#if defined(_WIN32)
+    const char* local = getenv("LOCALAPPDATA");
+    if (local && local[0] && n < 4) {
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s\\retcomm\\toolchains\\cmake-clang-v1", local);
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s\\gbarecomp\\toolchains\\cmake-clang-v1", local);
+    }
+#else
+    const char* xdg = getenv("XDG_DATA_HOME");
+    const char* home = getenv("HOME");
+    if (xdg && xdg[0] && n < 4) {
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s/retcomm/toolchains/cmake-clang-v1", xdg);
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s/gbarecomp/toolchains/cmake-clang-v1", xdg);
+    } else if (home && home[0] && n < 4) {
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s/.local/share/retcomm/toolchains/cmake-clang-v1", home);
+        snprintf(bases[n++], sizeof(bases[0]),
+                 "%s/.local/share/gbarecomp/toolchains/cmake-clang-v1", home);
+    }
+#endif
+    for (int i = 0; i < n; ++i) {
+        if (resolve_toolchain_bin_under(bases[i], out, cap))
+            return 1;
+    }
+    return 0;
+}
+
+static int resolve_toolchain_bin(char* out, size_t cap) {
+    const char* env_keys[] = {
+        "GBARECOMP_TOOLCHAIN_DIR", "EMERALD_TOOLCHAIN_DIR",
+        "RETCOMM_TOOLCHAIN_DIR", "TOOLCHAIN_DIR", "BPE_TOOLCHAIN_DIR", NULL};
+    for (int i = 0; env_keys[i]; ++i) {
+        const char* e = getenv(env_keys[i]);
+        if (e && e[0] && resolve_toolchain_bin_under(e, out, cap))
+            return 1;
+    }
+    if (g_project_root[0]) {
+        char wrap[1100];
+        if (join_path(wrap, sizeof(wrap), g_project_root, "toolchain") &&
+            resolve_toolchain_bin_under(wrap, out, cap))
+            return 1;
+    }
+    return resolve_shared_toolchain_bin(out, cap);
 }
 
 static void activate_toolchain_path(void) {
@@ -393,12 +446,32 @@ static int json_get_number(const char* line, const char* key, double* out) {
     return 1;
 }
 
+static void remember_toolchain_bin_from_json(const char* line) {
+    char bin[1100] = "";
+    if (!json_get_string(line, "toolchain_bin", bin, sizeof(bin)) || !bin[0])
+        return;
+    /* ensure-toolchain returns …/bin; env aliases want the pack root. */
+    char parent[1100];
+    if (!dirname_copy(parent, sizeof(parent), bin))
+        return;
+#if defined(_WIN32)
+    _putenv_s("GBARECOMP_TOOLCHAIN_DIR", parent);
+    _putenv_s("RETCOMM_TOOLCHAIN_DIR", parent);
+#else
+    setenv("GBARECOMP_TOOLCHAIN_DIR", parent, 1);
+    setenv("RETCOMM_TOOLCHAIN_DIR", parent, 1);
+#endif
+}
+
 static void handle_progress_line(const char* line,
                                  RecompLauncherCPrepareProgressFn on_progress,
                                  void* progress_ctx) {
-    if (!line || line[0] != '{' || !on_progress) return;
+    if (!line || line[0] != '{') return;
     char event[64] = "";
     json_get_string(line, "event", event, sizeof(event));
+    if (strcmp(event, "result") == 0)
+        remember_toolchain_bin_from_json(line);
+    if (!on_progress) return;
     if (strcmp(event, "phase") == 0) {
         char message[240] = "";
         char phase[64] = "";
@@ -588,6 +661,201 @@ static int run_generate_posix(const char* rom,
 }
 #endif
 
+static int host_toolchain_is_ready(void) {
+    if (!g_ready)
+        return 0;
+    activate_toolchain_path();
+    return find_cmake(g_cmake, sizeof(g_cmake)) ? 1 : 0;
+}
+
+static int host_ensure_toolchain_with_progress(
+    int download, const char* zip_path, char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx) {
+    if (!g_ready) {
+        snprintf(err_msg, err_cap, "Local codegen tools are not available.");
+        return 0;
+    }
+    activate_toolchain_path();
+    if (find_cmake(g_cmake, sizeof(g_cmake)))
+        return 1;
+
+    if (on_progress)
+        on_progress(progress_ctx, 0.05f,
+                    zip_path && zip_path[0]
+                        ? "Installing toolchain from zip…"
+                        : (download ? "Downloading portable cmake/clang…"
+                                    : "Looking for portable toolchain…"));
+
+#if defined(_WIN32)
+    char cmdline[4096];
+    if (zip_path && zip_path[0]) {
+        snprintf(cmdline, sizeof(cmdline),
+                 "\"%s\" \"%s\" ensure-toolchain --project-root \"%s\" "
+                 "--from-zip \"%s\" --json-progress",
+                 g_python, g_cli_path, g_project_root, zip_path);
+    } else if (download) {
+        snprintf(cmdline, sizeof(cmdline),
+                 "\"%s\" \"%s\" ensure-toolchain --project-root \"%s\" "
+                 "--json-progress",
+                 g_python, g_cli_path, g_project_root);
+    } else {
+        snprintf(cmdline, sizeof(cmdline),
+                 "\"%s\" \"%s\" ensure-toolchain --project-root \"%s\" "
+                 "--no-download --json-progress",
+                 g_python, g_cli_path, g_project_root);
+    }
+    {
+        SECURITY_ATTRIBUTES sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        HANDLE rd = NULL, wr = NULL;
+        if (!CreatePipe(&rd, &wr, &sa, 0)) {
+            snprintf(err_msg, err_cap, "CreatePipe failed.");
+            return 0;
+        }
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si));
+        memset(&pi, 0, sizeof(pi));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        char cmd_mutable[4096];
+        snprintf(cmd_mutable, sizeof(cmd_mutable), "%s", cmdline);
+        if (!CreateProcessA(NULL, cmd_mutable, NULL, NULL, TRUE, 0, NULL,
+                            g_project_root, &si, &pi)) {
+            CloseHandle(rd);
+            CloseHandle(wr);
+            snprintf(err_msg, err_cap, "Failed to spawn ensure-toolchain.");
+            return 0;
+        }
+        CloseHandle(wr);
+        char buf[512];
+        char line[1024];
+        size_t line_len = 0;
+        DWORD nread = 0;
+        while (ReadFile(rd, buf, sizeof(buf), &nread, NULL) && nread > 0) {
+            for (DWORD i = 0; i < nread; ++i) {
+                char c = buf[i];
+                if (c == '\r') continue;
+                if (c == '\n') {
+                    line[line_len] = '\0';
+                    handle_progress_line(line, on_progress, progress_ctx);
+                    line_len = 0;
+                    continue;
+                }
+                if (line_len + 1 < sizeof(line))
+                    line[line_len++] = c;
+            }
+        }
+        if (line_len) {
+            line[line_len] = '\0';
+            handle_progress_line(line, on_progress, progress_ctx);
+        }
+        CloseHandle(rd);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (code != 0) {
+            snprintf(err_msg, err_cap, "ensure-toolchain failed (exit %lu).",
+                     (unsigned long)code);
+            return 0;
+        }
+    }
+#else
+    {
+        char* argv[16];
+        int argc = 0;
+        char zip_storage[1100];
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            snprintf(err_msg, err_cap, "pipe() failed: %s", strerror(errno));
+            return 0;
+        }
+        argv[argc++] = g_python;
+        argv[argc++] = g_cli_path;
+        argv[argc++] = "ensure-toolchain";
+        argv[argc++] = "--project-root";
+        argv[argc++] = g_project_root;
+        if (zip_path && zip_path[0]) {
+            snprintf(zip_storage, sizeof(zip_storage), "%s", zip_path);
+            argv[argc++] = "--from-zip";
+            argv[argc++] = zip_storage;
+        } else if (!download) {
+            argv[argc++] = "--no-download";
+        }
+        argv[argc++] = "--json-progress";
+        argv[argc] = NULL;
+
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+        posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+        pid_t pid = 0;
+        int rc = posix_spawnp(&pid, g_python, &actions, NULL, argv, environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipefd[1]);
+        if (rc != 0) {
+            close(pipefd[0]);
+            snprintf(err_msg, err_cap, "Failed to spawn ensure-toolchain: %s",
+                     strerror(rc));
+            return 0;
+        }
+        FILE* out = fdopen(pipefd[0], "r");
+        if (!out) {
+            close(pipefd[0]);
+            waitpid(pid, NULL, 0);
+            snprintf(err_msg, err_cap, "fdopen failed.");
+            return 0;
+        }
+        char line[1024];
+        while (fgets(line, sizeof(line), out)) {
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                line[--n] = '\0';
+            handle_progress_line(line, on_progress, progress_ctx);
+        }
+        fclose(out);
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) {
+            snprintf(err_msg, err_cap, "waitpid failed: %s", strerror(errno));
+            return 0;
+        }
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        if (code != 0) {
+            snprintf(err_msg, err_cap, "ensure-toolchain failed (exit %d).",
+                     code);
+            return 0;
+        }
+    }
+#endif
+
+    activate_toolchain_path();
+    if (find_cmake(g_cmake, sizeof(g_cmake)))
+        return 1;
+    snprintf(err_msg, err_cap,
+             "Toolchain install finished but cmake was not found. "
+             "Use a cmake-clang-v1 pack, set GBARECOMP_TOOLCHAIN_DIR / "
+             "RETCOMM_TOOLCHAIN_DIR, or install cmake on PATH.");
+    return 0;
+}
+
+static int host_ensure_toolchain(RecompLauncherCPrepareProgressFn on_progress,
+                                 void* progress_ctx, char* err_msg,
+                                 size_t err_cap) {
+    return host_ensure_toolchain_with_progress(1, NULL, err_msg, err_cap,
+                                               on_progress, progress_ctx);
+}
+
 static int host_prepare_generate(const char* source_path, char* out_path,
                                  size_t out_cap, char* err_msg, size_t err_cap,
                                  RecompLauncherCPrepareProgressFn on_progress,
@@ -671,13 +939,22 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "  ping -n 2 127.0.0.1 >NUL\r\n"
             "  goto waitloop\r\n"
             ")\r\n"
-            "echo Building...\r\n"
+            "echo Ensuring toolchain...\r\n"
             "cd /d \"%%ROOT%%\"\r\n"
             "if defined TC_BIN set \"PATH=%%TC_BIN%%;%%PATH%%\"\r\n"
+            "\"%%PYTHON%%\" \"%%CLI%%\" ensure-toolchain --project-root \"%%ROOT%%\"\r\n"
+            "if errorlevel 1 (\r\n"
+            "  echo.\r\n"
+            "  echo Toolchain missing. Download cmake-clang-v1 or set\r\n"
+            "  echo GBARECOMP_TOOLCHAIN_DIR / RETCOMM_TOOLCHAIN_DIR.\r\n"
+            "  pause\r\n"
+            "  exit /b 1\r\n"
+            ")\r\n"
+            "echo Building...\r\n"
             "\"%%PYTHON%%\" \"%%CLI%%\" rebuild --project-root \"%%ROOT%%\" "
             "--build-dir \"%%BUILD_DIR%%\" --target \"%%TARGET%%\" "
             "--exe-basename \"%%TARGET%%\" "
-            "--prune-after toolchain,build-intermediates\r\n"
+            "--prune-after build-intermediates\r\n"
             "if errorlevel 1 (\r\n"
             "  echo.\r\n"
             "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
@@ -770,6 +1047,8 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
         return 0;
     }
 
+    if (!host_ensure_toolchain(on_progress, progress_ctx, err_msg, err_cap))
+        return 0;
     activate_toolchain_path();
     if (!g_cmake[0])
         find_cmake(g_cmake, sizeof(g_cmake));
@@ -904,14 +1183,16 @@ void gbarecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         return;
 
     g_ready = 1;
+    activate_toolchain_path();
     gi->prepare_with_progress = host_prepare_generate;
     gi->prepare_use_selected_rom = 1;
-    gi->prepare_section_title = "2. Generate C sources & rebuild";
+    gi->prepare_section_title = "Generate C sources & rebuild";
     gi->prepare_busy_status = "Generating sources…";
     gi->prepare_success_status = "Sources ready — building…";
 
-    const int can_rebuild = find_cmake(g_cmake, sizeof(g_cmake)) &&
-                            resolve_build_paths();
+    /* Rebuild is offered whenever the build tree can be formed; wizard page 0
+     * installs cmake-clang-v1 before Generate & rebuild (BPE modular flow). */
+    const int can_rebuild = resolve_build_paths();
     if (can_rebuild) {
         gi->prepare_disc_label = "Generate & rebuild…";
 #if defined(_WIN32)
@@ -937,14 +1218,17 @@ void gbarecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         gi->rebuild_with_progress = host_rebuild_game;
         gi->rebuild_after_prepare = 1;
         gi->relaunch_after_rebuild = 1;
+        gi->setup_needs_toolchain = 1;
+        gi->toolchain_is_ready = host_toolchain_is_ready;
+        gi->ensure_toolchain_with_progress = host_ensure_toolchain_with_progress;
     } else {
         gi->prepare_disc_label = "Generate sources…";
         gi->prepare_disc_note =
             cfg->prepare_note_no_cmake
                 ? cfg->prepare_note_no_cmake
                 : "Regenerates sources with the local gbarecomp SDK. "
-                  "CMake/build dir not found — rebuild manually with "
-                  "cmake --build, then relaunch.";
+                  "Build dir could not be resolved — rebuild manually, then "
+                  "relaunch.";
         gi->prepare_success_status =
             "Sources generated. Rebuild manually, then relaunch.";
     }

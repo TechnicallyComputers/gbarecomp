@@ -2,10 +2,11 @@
 """Headless ROM → generate / rebuild SDK for gbarecomp games.
 
 Commands:
-  verify-rom   Hash-check a .gba dump (SHA-1 primary)
-  generate     Run gba_recompile into an existing game tree (+ optional BIOS)
-  rebuild      cmake --build for an existing project
-  build        Greenfield scaffolder (delegates to tools/cli.py)
+  verify-rom         Hash-check a .gba dump (SHA-1 primary)
+  generate           Run gba_recompile into an existing game tree (+ optional BIOS)
+  rebuild            cmake --build for an existing project
+  ensure-toolchain   Resolve / download cmake-clang-v1 (RetComM modular flow)
+  build              Greenfield scaffolder (delegates to tools/cli.py)
 
 Exit codes: 0 ok · 1 runtime · 2 usage · 3 ROM verify fail
 """
@@ -34,6 +35,7 @@ from sdk_generate import (  # noqa: E402
     EXIT_ERROR,
     EXIT_OK,
     EXIT_USAGE,
+    add_ensure_toolchain_parser,
     add_generate_parser,
     add_rebuild_parser,
     add_verify_parser,
@@ -96,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_verify_parser(sub)
     add_generate_parser(sub)
     add_rebuild_parser(sub)
+    add_ensure_toolchain_parser(sub)
     return ap
 
 

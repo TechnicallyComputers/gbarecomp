@@ -12,13 +12,13 @@
 #   --framework DIR         gbarecomp source tree (default: <cwd>/gbarecomp)
 #   --recompiler-build DIR  Where gba_recompile was built (repeatable)
 #   --toolchain-dir DIR     Pack root with bin/; embedded as stage/toolchain/
-#   --allow-no-toolchain    Warn instead of failing when toolchain unset
+#   --allow-no-toolchain    Lean zip (default for titles): no embedded toolchain/
 #   --host-exe PATH         Host PE for Windows DLL bundling (optional)
 #   --runtime-bin DIR       MinGW runtime DLL search dir (repeatable)
 #   --search-dir DIR        Extra DLL search dir (repeatable)
 #   --require-cli           Require gbarecomp_cli.py (default on)
 #
-# Env aliases for toolchain dir (first wins):
+# Env aliases for toolchain dir (only when embedding is expected):
 #   GBARECOMP_TOOLCHAIN_DIR, EMERALD_TOOLCHAIN_DIR, TOOLCHAIN_DIR, BPE_TOOLCHAIN_DIR
 set -euo pipefail
 
@@ -28,7 +28,8 @@ FW_TOOLS="${SCRIPT_DIR}"
 STAGE=""
 FRAMEWORK=""
 RECOMPILER_BUILDS=()
-TOOLCHAIN_DIR="${GBARECOMP_TOOLCHAIN_DIR:-${EMERALD_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR:-}}}}"
+TOOLCHAIN_DIR=""
+TOOLCHAIN_DIR_SET=0
 ALLOW_NO_TOOLCHAIN=0
 HOST_EXE=""
 RUNTIME_BINS=()
@@ -46,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --stage) STAGE="${2:?}"; shift 2 ;;
     --framework) FRAMEWORK="${2:?}"; shift 2 ;;
     --recompiler-build) RECOMPILER_BUILDS+=("${2:?}"); shift 2 ;;
-    --toolchain-dir) TOOLCHAIN_DIR="${2:?}"; shift 2 ;;
+    --toolchain-dir) TOOLCHAIN_DIR="${2:?}"; TOOLCHAIN_DIR_SET=1; shift 2 ;;
     --allow-no-toolchain) ALLOW_NO_TOOLCHAIN=1; shift ;;
     --host-exe) HOST_EXE="${2:?}"; shift 2 ;;
     --runtime-bin) RUNTIME_BINS+=("${2:?}"); shift 2 ;;
@@ -65,6 +66,11 @@ if [[ -z "${STAGE}" ]]; then
   usage
 fi
 STAGE="$(cd "${STAGE}" && pwd)"
+
+# Env aliases only when embedding is expected (not --allow-no-toolchain alone).
+if [[ "${TOOLCHAIN_DIR_SET}" -eq 0 && "${ALLOW_NO_TOOLCHAIN}" -eq 0 ]]; then
+  TOOLCHAIN_DIR="${GBARECOMP_TOOLCHAIN_DIR:-${EMERALD_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR:-}}}}"
+fi
 
 if [[ -z "${FRAMEWORK}" ]]; then
   if [[ -d "${PWD}/gbarecomp" ]]; then
@@ -166,7 +172,8 @@ if [[ -n "${TOOLCHAIN_DIR}" && -d "${TOOLCHAIN_DIR}" ]]; then
   fi
   echo "bundled toolchain from ${TOOLCHAIN_DIR}"
 elif [[ "${ALLOW_NO_TOOLCHAIN}" -eq 1 ]]; then
-  echo "warning: toolchain unset — zip will need system cmake/ninja" >&2
+  echo "note: no embedded toolchain/ — RetComM/wizard will download cmake-clang-v1" \
+       "(or accept an offline zip / GBARECOMP_TOOLCHAIN_DIR)" >&2
 else
   echo "error: toolchain dir required (pass --toolchain-dir or set GBARECOMP_TOOLCHAIN_DIR)" >&2
   exit 1

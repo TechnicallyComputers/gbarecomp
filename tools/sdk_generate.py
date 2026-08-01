@@ -25,6 +25,17 @@ from typing import Any, Optional
 from sdk_progress import ProgressReporter
 from sdk_rom import RomVerifyError, verify_rom
 
+try:
+    from toolchain_pack import (  # type: ignore
+        activate_toolchain_bin,
+        ensure_toolchain as ensure_toolchain_pack,
+        resolve_toolchain_bin as resolve_pack_toolchain_bin,
+    )
+except ImportError:  # pragma: no cover
+    activate_toolchain_bin = None  # type: ignore
+    ensure_toolchain_pack = None  # type: ignore
+    resolve_pack_toolchain_bin = None  # type: ignore
+
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -388,6 +399,9 @@ def generate_command(args: argparse.Namespace, progress: ProgressReporter) -> in
 
 
 def resolve_embedded_toolchain_bin(project_root: pathlib.Path) -> Optional[pathlib.Path]:
+    """Resolve portable toolchain bin/ (env → zip-root toolchain/ → shared cache)."""
+    if resolve_pack_toolchain_bin is not None:
+        return resolve_pack_toolchain_bin(project_root)
     root = project_root / "toolchain"
     if not root.is_dir():
         return None
@@ -411,24 +425,73 @@ def activate_embedded_toolchain(
     bin_dir = resolve_embedded_toolchain_bin(project_root)
     if not bin_dir:
         return False
+    if activate_toolchain_bin is not None:
+        activate_toolchain_bin(
+            bin_dir, log=(progress.log if progress else None)
+        )
+        return True
     prefix = str(bin_dir)
     cur = os.environ.get("PATH", "")
     parts = cur.split(os.pathsep) if cur else []
     if parts and pathlib.Path(parts[0]) == bin_dir:
         return True
     os.environ["PATH"] = prefix + (os.pathsep + cur if cur else "")
-    for name, env_key in (
-        ("clang", "CC"),
-        ("clang++", "CXX"),
-        ("clang.exe", "CC"),
-        ("clang++.exe", "CXX"),
-    ):
-        cand = bin_dir / name
-        if cand.is_file() and env_key not in os.environ:
-            os.environ[env_key] = str(cand)
     if progress:
-        progress.log(f"Using embedded toolchain: {bin_dir}")
+        progress.log(f"Using toolchain: {bin_dir}")
     return True
+
+
+def ensure_toolchain_for_rebuild(
+    project_root: pathlib.Path,
+    progress: ProgressReporter,
+    *,
+    from_zip: str = "",
+    download: bool = True,
+) -> bool:
+    """Ensure cmake via cache / download / offline zip (modular toolchain flow)."""
+    if ensure_toolchain_pack is None:
+        return activate_embedded_toolchain(project_root, progress)
+    try:
+        ensure_toolchain_pack(
+            project_root,
+            from_zip=pathlib.Path(from_zip) if from_zip else None,
+            download=download and not from_zip,
+            log=progress.log,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        progress.log(f"Toolchain ensure: {exc}")
+        return False
+
+
+def ensure_toolchain_command(
+    args: argparse.Namespace, progress: ProgressReporter
+) -> int:
+    project_root = (
+        pathlib.Path(args.project_root).expanduser().resolve()
+        if args.project_root
+        else pathlib.Path.cwd().resolve()
+    )
+    zip_arg = (getattr(args, "from_zip", None) or "").strip()
+    want_download = (not zip_arg) and not bool(getattr(args, "no_download", False))
+    if getattr(args, "download", False):
+        want_download = not zip_arg
+    if ensure_toolchain_pack is None:
+        progress.error("toolchain_pack.py missing", code=EXIT_ERROR)
+        return EXIT_ERROR
+    try:
+        bin_dir = ensure_toolchain_pack(
+            project_root,
+            from_zip=pathlib.Path(zip_arg) if zip_arg else None,
+            download=want_download,
+            log=progress.log,
+        )
+    except Exception as exc:  # noqa: BLE001
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
+    progress.phase("done", pct=1.0, message=f"Toolchain ready: {bin_dir}")
+    progress.result(ok=True, toolchain_bin=str(bin_dir))
+    return EXIT_OK
 
 
 def clamp_future_mtimes(
@@ -557,7 +620,28 @@ def rebuild_command(args: argparse.Namespace, progress: ProgressReporter) -> int
         progress.error("--target is required", code=EXIT_USAGE)
         return EXIT_USAGE
 
-    activate_embedded_toolchain(project_root, progress)
+    zip_arg = (getattr(args, "toolchain_zip", None) or "").strip()
+    no_dl = bool(getattr(args, "no_toolchain_download", False))
+    if zip_arg:
+        if not ensure_toolchain_for_rebuild(
+            project_root, progress, from_zip=zip_arg, download=False
+        ):
+            progress.error(
+                f"Failed to install toolchain from zip: {zip_arg}", code=EXIT_ERROR
+            )
+            return EXIT_ERROR
+    elif not activate_embedded_toolchain(project_root, progress):
+        if no_dl or not ensure_toolchain_for_rebuild(
+            project_root, progress, download=True
+        ):
+            progress.error(
+                "No portable toolchain and no cmake on PATH. "
+                "Run: gbarecomp_cli.py ensure-toolchain --download "
+                "(or pass --toolchain-zip / set GBARECOMP_TOOLCHAIN_DIR).",
+                code=EXIT_ERROR,
+            )
+            return EXIT_ERROR
+
     cmake = os.environ.get("CMAKE") or shutil.which("cmake")
     if not cmake:
         progress.error("cmake not found on PATH (set CMAKE=...)", code=EXIT_ERROR)
@@ -751,9 +835,44 @@ def add_rebuild_parser(sub: Any) -> None:
         help="extra cmake configure arg (repeatable); also GBARECOMP_CMAKE_EXTRA",
     )
     p.add_argument(
+        "--toolchain-zip",
+        default="",
+        help="offline cmake-clang-v1-*.zip (install into shared cache)",
+    )
+    p.add_argument(
+        "--no-toolchain-download",
+        action="store_true",
+        help="do not download cmake-clang-v1 when cache/env/embedded missing",
+    )
+    p.add_argument(
         "--prune-after",
         default="",
         help="comma list after success: toolchain, build-intermediates, all",
     )
     p.add_argument("--json-progress", action="store_true")
     p.set_defaults(handler=rebuild_command)
+
+
+def add_ensure_toolchain_parser(sub: Any) -> None:
+    p = sub.add_parser(
+        "ensure-toolchain",
+        help="resolve / download / unpack cmake-clang-v1 into the shared cache",
+    )
+    p.add_argument("--project-root", default="", help="game project root")
+    p.add_argument(
+        "--from-zip",
+        default="",
+        help="install from a local cmake-clang-v1-*.zip",
+    )
+    p.add_argument(
+        "--download",
+        action="store_true",
+        help="force download when no cache (default if neither --from-zip nor --no-download)",
+    )
+    p.add_argument(
+        "--no-download",
+        action="store_true",
+        help="only reuse env / project toolchain/ / shared cache",
+    )
+    p.add_argument("--json-progress", action="store_true")
+    p.set_defaults(handler=ensure_toolchain_command)

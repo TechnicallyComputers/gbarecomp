@@ -122,6 +122,24 @@ an incomplete cache that has `CMakeCache.txt` but no generator files).
 Setup zips must ship `gbarecomp/third_party/tomlpp/toml.hpp` so configure
 does not need network FetchContent.
 
+### Modular toolchain (lean setup zips)
+
+Default release packs do **not** embed `toolchain/`. The recomp-ui wizard
+page 0 / RetComM download `cmake-clang-v1` from
+`TechnicallyComputers/retcomm-toolchains` into a shared cache
+(`~/.local/share/gbarecomp/toolchains/…` or RetComM’s
+`…/retcomm/toolchains/…`).
+
+```bash
+python gbarecomp_cli.py ensure-toolchain --project-root . --download
+# or offline:
+python gbarecomp_cli.py ensure-toolchain --from-zip cmake-clang-v1-linux-x64.zip
+```
+
+Env overrides: `GBARECOMP_TOOLCHAIN_DIR`, `EMERALD_TOOLCHAIN_DIR`,
+`RETCOMM_TOOLCHAIN_DIR`. Opt-in embed for offline-first CI:
+`EMERALD_EMBED_TOOLCHAIN=1` + toolchain dir when packaging.
+
 Folder layout stays `build/` on every OS so RetComM and other tools can treat
 projects uniformly.
 
