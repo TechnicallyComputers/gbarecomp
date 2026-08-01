@@ -19,6 +19,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Optional
 
 from sdk_progress import ProgressReporter
@@ -430,6 +431,77 @@ def activate_embedded_toolchain(
     return True
 
 
+def clamp_future_mtimes(
+    root: pathlib.Path,
+    *,
+    skip: Optional[pathlib.Path] = None,
+    now: Optional[float] = None,
+) -> int:
+    """Clamp mtimes ahead of *now* so Ninja does not infinite-reconfigure.
+
+    Release zips often preserve CI clocks that are slightly ahead of a user's
+    clock. Ninja then treats every source as newer than ``build.ninja`` and
+    fails with ``manifest 'build.ninja' still dirty after 100 tries``.
+    """
+    if not root.is_dir():
+        return 0
+    stamp = time.time() if now is None else now
+    skip_res: Optional[pathlib.Path] = None
+    if skip is not None:
+        try:
+            skip_res = skip.resolve()
+        except OSError:
+            skip_res = skip
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dpath = pathlib.Path(dirpath)
+        try:
+            d_res = dpath.resolve()
+        except OSError:
+            d_res = dpath
+        if skip_res is not None and (
+            d_res == skip_res or skip_res in d_res.parents
+        ):
+            dirnames[:] = []
+            continue
+        pruned: list[str] = []
+        for x in dirnames:
+            if x == ".git":
+                continue
+            if skip_res is not None:
+                try:
+                    if (dpath / x).resolve() == skip_res:
+                        continue
+                except OSError:
+                    pass
+            pruned.append(x)
+        dirnames[:] = pruned
+        for name in filenames:
+            p = dpath / name
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > stamp:
+                try:
+                    os.utime(p, (stamp, stamp), follow_symlinks=False)
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
+def _cmake_generator_ready(build_dir: pathlib.Path) -> bool:
+    """True when a prior configure produced a usable build system."""
+    if not (build_dir / "CMakeCache.txt").is_file():
+        return False
+    return (
+        (build_dir / "build.ninja").is_file()
+        or (build_dir / "Makefile").is_file()
+        or (build_dir / "build.make").is_file()
+    )
+
+
 def prune_after_rebuild(
     project_root: pathlib.Path,
     build_dir: pathlib.Path,
@@ -491,37 +563,71 @@ def rebuild_command(args: argparse.Namespace, progress: ProgressReporter) -> int
         progress.error("cmake not found on PATH (set CMAKE=...)", code=EXIT_ERROR)
         return EXIT_ERROR
 
-    build_dir.mkdir(parents=True, exist_ok=True)
-    if not (build_dir / "CMakeCache.txt").is_file():
-        progress.phase("configure", pct=0.05, message=f"cmake -S {project_root} -B {build_dir}")
-        gen = ["-G", "Ninja"] if shutil.which("ninja") else []
-        cfg_cmd = [
-            cmake,
-            "-S",
-            str(project_root),
-            "-B",
-            str(build_dir),
-            *gen,
-            "-DCMAKE_BUILD_TYPE=Release",
-        ]
-        progress.log(" ".join(cfg_cmd))
-        proc = subprocess.run(
-            cfg_cmd,
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            errors="replace",
+    cmake_extra: list[str] = []
+    for extra in getattr(args, "cmake_arg", None) or []:
+        if extra:
+            cmake_extra.append(str(extra))
+    env_extra = (os.environ.get("GBARECOMP_CMAKE_EXTRA") or "").strip()
+    if env_extra:
+        cmake_extra.extend(env_extra.split())
+    # Full playable link after local generate (not the CI setup-host shape).
+    # Harmless unused cache entries when a title does not define the option.
+    cmake_extra.append("-DGBARECOMP_ALLOW_NO_GENERATED=OFF")
+    cmake_extra.append("-DEMERALD_FORCE_SETUP_HOST=OFF")
+
+    clamped = clamp_future_mtimes(project_root, skip=build_dir)
+    if clamped:
+        progress.log(
+            f"Clamped {clamped} future mtime(s) under {project_root} "
+            "(avoids Ninja dirty-manifest loop from release-zip clocks)."
         )
-        for stream in (proc.stdout, proc.stderr):
-            if stream:
-                for line in stream.splitlines():
-                    if line.strip():
-                        progress.log(line)
-        if proc.returncode != 0:
-            progress.error(
-                f"cmake configure failed (exit {proc.returncode})", code=EXIT_ERROR
-            )
-            return EXIT_ERROR
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    if (build_dir / "CMakeCache.txt").is_file() and not _cmake_generator_ready(
+        build_dir
+    ):
+        progress.log(
+            f"Incomplete cmake tree under {build_dir} — wiping and reconfiguring"
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always reconfigure (BPE-style) so generated cart C and FORCE_SETUP_HOST=OFF
+    # are picked up even when a prior setup-host cache exists.
+    progress.phase(
+        "configure", pct=0.05, message=f"cmake -S {project_root} -B {build_dir}"
+    )
+    gen: list[str] = []
+    if not (build_dir / "CMakeCache.txt").is_file() and shutil.which("ninja"):
+        gen = ["-G", "Ninja"]
+    cfg_cmd = [
+        cmake,
+        "-S",
+        str(project_root),
+        "-B",
+        str(build_dir),
+        *gen,
+        "-DCMAKE_BUILD_TYPE=Release",
+        *cmake_extra,
+    ]
+    progress.log(" ".join(cfg_cmd))
+    proc = subprocess.run(
+        cfg_cmd,
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    for stream in (proc.stdout, proc.stderr):
+        if stream:
+            for line in stream.splitlines():
+                if line.strip():
+                    progress.log(line)
+    if proc.returncode != 0:
+        progress.error(
+            f"cmake configure failed (exit {proc.returncode})", code=EXIT_ERROR
+        )
+        return EXIT_ERROR
 
     progress.phase("build", pct=0.2, message=f"cmake --build {build_dir} --target {target}")
     cmd = [cmake, "--build", str(build_dir), "--parallel", "--target", target]
@@ -629,6 +735,12 @@ def add_rebuild_parser(sub: Any) -> None:
     p.add_argument("--build-dir", required=True, help="cmake build directory")
     p.add_argument("--target", required=True, help="cmake target name")
     p.add_argument("--exe-basename", default="", help="optional launch binary name")
+    p.add_argument(
+        "--cmake-arg",
+        action="append",
+        default=[],
+        help="extra cmake configure arg (repeatable); also GBARECOMP_CMAKE_EXTRA",
+    )
     p.add_argument(
         "--prune-after",
         default="",

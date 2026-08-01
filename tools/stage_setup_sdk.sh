@@ -146,6 +146,11 @@ if [[ ! -f "${STAGE}/gbarecomp/bios/gba_bios.toml" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${STAGE}/gbarecomp/third_party/tomlpp/toml.hpp" ]]; then
+  echo "error: missing gbarecomp/third_party/tomlpp/toml.hpp (offline rebuild needs vendored toml++)" >&2
+  exit 1
+fi
+
 if [[ -n "${TOOLCHAIN_DIR}" && -d "${TOOLCHAIN_DIR}" ]]; then
   if [[ ! -d "${TOOLCHAIN_DIR}/bin" ]]; then
     echo "error: toolchain dir missing bin/: ${TOOLCHAIN_DIR}" >&2

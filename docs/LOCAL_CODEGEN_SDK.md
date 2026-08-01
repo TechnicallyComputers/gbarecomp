@@ -113,8 +113,14 @@ built `gba_recompile` binary when it is not on `PATH`.
 
 | OS | Behavior |
 |----|----------|
-| Linux / macOS | In-process `cmake --build`, then `exec` the new binary |
+| Linux / macOS | In-process `cmake` reconfigure + `--build`, then `exec` the new binary |
 | Windows | Writes `build/recomp_deferred_rebuild.cmd`, exits; helper waits for the game PID, builds, starts the new exe (avoids a locked `.exe`) |
+
+`rebuild` always reconfigures (clears setup-host flags such as
+`EMERALD_FORCE_SETUP_HOST`, clamps future zip mtimes for Ninja, and wipes
+an incomplete cache that has `CMakeCache.txt` but no generator files).
+Setup zips must ship `gbarecomp/third_party/tomlpp/toml.hpp` so configure
+does not need network FetchContent.
 
 Folder layout stays `build/` on every OS so RetComM and other tools can treat
 projects uniformly.

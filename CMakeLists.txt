@@ -413,10 +413,9 @@ endfunction()
 add_executable(gba_scan tools/gba_scan/main.cpp)
 target_link_libraries(gba_scan PRIVATE gbarecomp_armv4t gbarecomp_gba)
 
-# A local toml++ checkout remains useful for offline development, but it is
-# intentionally ignored.  Fresh clones/worktrees must still be able to build
-# gba_recompile, so resolve the pinned upstream dependency into the build tree
-# when the local single-header checkout is absent.
+# toml++ for gba_recompile. Prefer the vendored amalgam
+# (third_party/tomlpp/toml.hpp) so setup-host zips configure offline.
+# FetchContent remains a fallback for sparse checkouts that omit it.
 find_path(GBARECOMP_TOMLPP_INCLUDE_DIR
     NAMES toml.hpp
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlpp"
@@ -434,7 +433,7 @@ if(NOT GBARECOMP_TOMLPP_INCLUDE_DIR)
         "gbarecomp: fetched pinned toml++ v3.4.0 for gba_recompile")
 else()
     message(STATUS
-        "gbarecomp: using local toml++ at ${GBARECOMP_TOMLPP_INCLUDE_DIR}")
+        "gbarecomp: using vendored toml++ at ${GBARECOMP_TOMLPP_INCLUDE_DIR}")
 endif()
 
 add_executable(gba_recompile
@@ -549,7 +548,10 @@ endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # tests — per-subsystem. Run with ctest.
+# Setup-host zips omit tests/ (see title package_setup_release); skip targets
+# when the sources are not present so offline rebuilds still configure.
 # ─────────────────────────────────────────────────────────────────────────────
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/armv4t/decoder_smoke.cpp")
 enable_testing()
 
 if(GBARECOMP_ENABLE_MODS)
@@ -747,6 +749,10 @@ if(GBARECOMP_SELFHEAL_MC_DIR)
         message(STATUS "gbarecomp: bash not found; skipping "
                        "selfheal_stage2_bios_identical + selfheal_coverage_sweep")
     endif()
+endif()
+
+else()
+    message(STATUS "gbarecomp: tests/ absent — skipping unit test targets")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────

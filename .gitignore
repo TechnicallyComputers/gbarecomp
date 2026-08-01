@@ -50,10 +50,12 @@ third_party/mgba/
 # this tree (gbarecomp/bios/gba_bios.toml).
 third_party/gba_bios_disasm/
 
-# toml++ single-header library. Vendored shallow clone; we only
-# need toml.hpp at the top level. License is MIT; full source
-# tree stays out of version control to keep diffs small.
-third_party/tomlpp/
+# toml++: commit the amalgamated header under third_party/tomlpp/
+# (toml.hpp + LICENSE + README). Ignore a full upstream clone if present.
+third_party/tomlpp/*
+!third_party/tomlpp/toml.hpp
+!third_party/tomlpp/LICENSE
+!third_party/tomlpp/README.md
 
 # jsmolka/gba-suite test ROMs (correctness benchmark). Cloned
 # locally; pre-built .gba files are the test fixtures. Sources
