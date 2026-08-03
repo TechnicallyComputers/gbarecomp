@@ -1084,8 +1084,12 @@ static int host_rebuild_game(const char* rom_path, char* out_exe_path,
 
 static int write_line_file(const char* path, const char* line) {
     FILE* f;
-    if (!path || !path[0] || !line || !line[0])
+    if (!path || !path[0])
         return 0;
+    if (!line || !line[0]) {
+        remove(path);
+        return 1;
+    }
     f = fopen(path, "w");
     if (!f)
         return 0;
@@ -1122,13 +1126,35 @@ static int read_line_file(const char* path, char* out, size_t cap) {
 static void write_sidecar_near_exe(const char* near_exe, const char* name,
                                    const char* value) {
     char dir[1100], path[1200];
-    if (!near_exe || !near_exe[0] || !name || !name[0] || !value || !value[0])
+    if (!near_exe || !near_exe[0] || !name || !name[0])
         return;
     if (!dirname_copy(dir, sizeof(dir), near_exe))
         return;
     if (!join_path(path, sizeof(path), dir, name))
         return;
-    write_line_file(path, value);
+    write_line_file(path, value ? value : "");
+}
+
+static int host_persist_setup(void* ctx, const char* rom_path,
+                              const char* bios_path) {
+    char path[1200];
+    (void)ctx;
+    if (g_project_root[0] &&
+        join_path(path, sizeof(path), g_project_root, "bios.cfg"))
+        write_line_file(path, (bios_path && bios_path[0]) ? bios_path : "");
+    write_line_file("bios.cfg", (bios_path && bios_path[0]) ? bios_path : "");
+    if (g_exe_path[0])
+        write_sidecar_near_exe(g_exe_path, "bios.cfg",
+                               (bios_path && bios_path[0]) ? bios_path : "");
+    if (rom_path && rom_path[0]) {
+        if (g_project_root[0] &&
+            join_path(path, sizeof(path), g_project_root, "rom.cfg"))
+            write_line_file(path, rom_path);
+        write_line_file("rom.cfg", rom_path);
+        if (g_exe_path[0])
+            write_sidecar_near_exe(g_exe_path, "rom.cfg", rom_path);
+    }
+    return 0;
 }
 
 static void persist_relaunch_sidecars(const char* near_exe,
@@ -1266,6 +1292,8 @@ void gbarecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
 
     g_ready = 1;
     activate_toolchain_path();
+    gi->persist_setup = host_persist_setup;
+    gi->persist_setup_ctx = NULL;
     gi->prepare_with_progress = host_prepare_generate;
     gi->prepare_use_selected_rom = 1;
     gi->prepare_section_title = "Generate C sources & rebuild";
