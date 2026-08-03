@@ -30,6 +30,7 @@
 #include <cstdint>
 
 #include "bus.h"   // armv4t::Bus — used for DMA byte transfers
+#include "gba_link.h"
 
 namespace gbarecomp::debug { class SnapshotWriter; class SnapshotReader; }
 
@@ -70,20 +71,27 @@ constexpr uint32_t BG1CNT    = 0x00A;
 constexpr uint32_t BG2CNT    = 0x00C;
 constexpr uint32_t BG3CNT    = 0x00E;
 constexpr uint32_t SOUNDBIAS = 0x088;  // u16
-constexpr uint32_t SIODATA32 = 0x120;  // u32 (also SIOMULTI0..3)
-constexpr uint32_t SIOCNT    = 0x128;  // u16 (SIO control)
-constexpr uint32_t IE        = 0x200;  // u16
-constexpr uint32_t IF        = 0x202;  // u16  (write-1-to-clear)
-constexpr uint32_t WAITCNT   = 0x204;  // u16
-constexpr uint32_t IME       = 0x208;  // u16/u32
-constexpr uint32_t POSTFLG   = 0x300;  // u8
-constexpr uint32_t HALTCNT   = 0x301;  // u8   (write-only)
+constexpr uint32_t SIOMULTI0   = 0x120;  // u16 (Normal32: SIODATA32 low)
+constexpr uint32_t SIOMULTI1   = 0x122;
+constexpr uint32_t SIOMULTI2   = 0x124;
+constexpr uint32_t SIOMULTI3   = 0x126;
+constexpr uint32_t SIODATA32   = 0x120;  // u32 alias of SIOMULTI0..1
+constexpr uint32_t SIOCNT      = 0x128;  // u16 (SIO control)
+constexpr uint32_t SIODATA8    = 0x12A;  // u8/u16 (Normal8); Multi: SIOMLT_SEND
+constexpr uint32_t SIOMLT_SEND = 0x12A;  // u16 alias
+constexpr uint32_t KEYINPUT    = 0x130;  // u16 (read-only)
+constexpr uint32_t KEYCNT      = 0x132;  // u16
+constexpr uint32_t RCNT        = 0x134;  // u16 (mode select / GPIO data)
+constexpr uint32_t IE          = 0x200;  // u16
+constexpr uint32_t IF          = 0x202;  // u16  (write-1-to-clear)
+constexpr uint32_t WAITCNT     = 0x204;  // u16
+constexpr uint32_t IME         = 0x208;  // u16/u32
+constexpr uint32_t POSTFLG     = 0x300;  // u8
+constexpr uint32_t HALTCNT     = 0x301;  // u8   (write-only)
 // Undocumented 8-bit write-only register touched by the real BIOS at reset.
 // Its purpose is unknown; accepting the write without inventing a side effect
 // matches the hardware-visible contract documented by GBATEK.
 constexpr uint32_t UNDOC_410 = 0x410;
-constexpr uint32_t KEYINPUT  = 0x130;  // u16 (read-only)
-constexpr uint32_t KEYCNT    = 0x132;  // u16
 }  // namespace IoReg
 
 class GbaIo {
@@ -104,6 +112,9 @@ public:
     // bytes and the BIOS's VRAM/PAL/OAM uploads vanish.
     void set_bus(armv4t::Bus* b) { bus_ = b; }
     void set_audio(GbaAudio* a) { audio_ = a; }
+    // Optional link-cable partner. nullptr = unplugged (default). Not owned.
+    void set_link_partner(LinkPartner* p) { link_ = p; }
+    LinkPartner* link_partner() const { return link_; }
 
     // Bus-side entry points. `off` is the offset into the IO region
     // (0x00..0x3FF). Out-of-range offsets are filtered by the bus.
@@ -205,11 +216,10 @@ public:
     void tick_timers(uint32_t cycles);
     uint32_t cycles_until_next_timer_event() const;
 
-    // Advance an in-flight SIO (Normal-mode, internal-clock) transfer by CPU
-    // cycles. On completion the start/busy bit clears, the shift register
-    // reads back open-bus (no partner), and the Serial IRQ fires if enabled
-    // (SIOCNT bit 14). Games use this as a periodic interrupt source — the
-    // handler re-kicks the transfer. (GBATEK § "SIO Normal Mode".)
+    // Advance an in-flight SIO transfer by CPU cycles. On completion the
+    // start/busy bit clears, RX data is written (open-bus with no partner;
+    // partner-supplied with a LinkPartner), and Serial IRQ fires if SIOCNT.14.
+    // (GBATEK § "SIO Normal Mode" / § "SIO Multi-Player Mode".)
     void tick_sio(uint32_t cycles);
     uint32_t cycles_until_next_sio_event() const;
 
@@ -235,6 +245,7 @@ private:
     GbaIrq*       irq_   = nullptr;
     armv4t::Bus*  bus_   = nullptr;
     GbaAudio*     audio_ = nullptr;
+    LinkPartner*  link_  = nullptr;
 
     // Flat backing for the 1 KB IO region. Anything not specially
     // handled is just read/written here.
@@ -251,10 +262,14 @@ private:
     uint32_t dma_next_source_[4] = {0, 0, 0, 0};
     uint32_t dma_next_dest_[4] = {0, 0, 0, 0};
 
-    // In-flight SIO Normal-mode transfer (internal clock). Armed by a
-    // start-bit rising edge written to SIOCNT; counts down to completion.
-    bool     sio_transfer_active_ = false;
-    uint32_t sio_cycles_remaining_ = 0;
+    // In-flight SIO transfer. Armed by a Start rising edge (and, with no
+    // partner, only Normal internal-clock — Multi/external stay idle).
+    bool              sio_transfer_active_ = false;
+    uint32_t          sio_cycles_remaining_ = 0;
+    SioTransferRequest sio_req_{};
+
+    void apply_sio_result(const SioTransferResult& result);
+    void try_arm_sio_transfer(uint16_t siocnt);
 
     // Accumulated DMA-stolen bus cycles awaiting charge to the master clock.
     uint32_t dma_steal_cycles_ = 0;

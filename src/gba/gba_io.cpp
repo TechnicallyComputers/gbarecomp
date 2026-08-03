@@ -490,22 +490,118 @@ void GbaIo::request_irq(uint16_t bit) {
     store_u16(&io_[IoReg::IF], static_cast<uint16_t>(old | bit));
 }
 
+void GbaIo::apply_sio_result(const SioTransferResult& result) {
+    uint16_t cnt = load_u16(&io_[IoReg::SIOCNT]);
+
+    if (sio_req_.mode == SioMode::Multi) {
+        store_u16(&io_[IoReg::SIOMULTI0], result.multi[0]);
+        store_u16(&io_[IoReg::SIOMULTI1], result.multi[1]);
+        store_u16(&io_[IoReg::SIOMULTI2], result.multi[2]);
+        store_u16(&io_[IoReg::SIOMULTI3], result.multi[3]);
+        // Refresh read-only MULTI status bits in SIOCNT (SI/SD/ID/Error).
+        cnt = static_cast<uint16_t>(cnt & ~0x007Cu);
+        if (result.is_child)    cnt = static_cast<uint16_t>(cnt | 0x0004u);
+        if (result.multi_ready) cnt = static_cast<uint16_t>(cnt | 0x0008u);
+        cnt = static_cast<uint16_t>(cnt |
+              (static_cast<uint16_t>(result.multi_id & 0x3u) << 4));
+        if (result.multi_error) cnt = static_cast<uint16_t>(cnt | 0x0040u);
+    } else if (sio_req_.mode == SioMode::Normal8) {
+        if (!link_) {
+            // Pre-link solo behavior: open-bus wrote SIODATA32 (not SIODATA8).
+            store_u32(&io_[IoReg::SIODATA32], 0xFFFFFFFFu);
+        } else {
+            store_u16(&io_[IoReg::SIODATA8],
+                      static_cast<uint16_t>(result.rx_data & 0xFFu));
+        }
+    } else {
+        // Normal32.
+        store_u32(&io_[IoReg::SIODATA32], result.rx_data);
+    }
+
+    // Auto-clear Start/Busy.
+    cnt = static_cast<uint16_t>(cnt & ~0x0080u);
+    store_u16(&io_[IoReg::SIOCNT], cnt);
+    if (cnt & 0x4000u) request_irq(IrqSerial);
+}
+
+void GbaIo::try_arm_sio_transfer(uint16_t siocnt) {
+    const uint16_t rcnt = load_u16(&io_[IoReg::RCNT]);
+    const SioMode mode = sio_decode_mode(siocnt, rcnt);
+
+    SioTransferRequest req{};
+    req.mode = mode;
+    req.baud = static_cast<uint8_t>(siocnt & 0x3u);
+
+    if (mode == SioMode::Normal8 || mode == SioMode::Normal32) {
+        req.internal_clock = (siocnt & 0x0001u) != 0;
+        if (mode == SioMode::Normal8)
+            req.tx_data = load_u16(&io_[IoReg::SIODATA8]) & 0xFFu;
+        else
+            req.tx_data = load_u32(&io_[IoReg::SIODATA32]);
+
+        // Unplugged: only internal-clock Normal completes (open-bus).
+        // External-clock slave never completes without a partner.
+        if (!link_) {
+            if (!req.internal_clock) return;
+            sio_req_ = req;
+            sio_cycles_remaining_ = sio_normal_transfer_cycles(siocnt);
+            sio_transfer_active_ = true;
+            return;
+        }
+
+        uint32_t cycles = sio_normal_transfer_cycles(siocnt);
+        if (!link_->on_transfer_start(req, &cycles)) return;
+        sio_req_ = req;
+        sio_cycles_remaining_ = cycles;
+        sio_transfer_active_ = true;
+        return;
+    }
+
+    if (mode == SioMode::Multi) {
+        req.internal_clock = true;  // parent drives the transfer
+        req.tx_data = load_u16(&io_[IoReg::SIOMLT_SEND]);
+
+        // Unplugged Multi: do not complete (no cable / SD never ready).
+        if (!link_) return;
+
+        uint32_t cycles = sio_multi_transfer_cycles(siocnt);
+        if (!link_->on_transfer_start(req, &cycles)) return;
+        sio_req_ = req;
+        sio_cycles_remaining_ = cycles;
+        sio_transfer_active_ = true;
+        return;
+    }
+
+    // UART / JOYBUS / GPIO: Phase 0 leaves Start set with no countdown.
+    (void)req;
+}
+
 void GbaIo::tick_sio(uint32_t cycles) {
     if (!sio_transfer_active_) return;
     if (cycles < sio_cycles_remaining_) {
         sio_cycles_remaining_ -= cycles;
         return;
     }
-    // Transfer complete.
     sio_transfer_active_  = false;
     sio_cycles_remaining_ = 0;
-    // Auto-clear the start/busy bit.
-    uint16_t cnt = load_u16(&io_[IoReg::SIOCNT]);
-    store_u16(&io_[IoReg::SIOCNT], static_cast<uint16_t>(cnt & ~0x0080u));
-    // With no connected partner the shift register reads back all-ones.
-    store_u32(&io_[IoReg::SIODATA32], 0xFFFFFFFFu);
-    // Serial IRQ on completion if enabled (SIOCNT bit 14).
-    if (cnt & 0x4000u) request_irq(IrqSerial);
+
+    SioTransferResult result{};
+    if (link_) {
+        link_->on_transfer_complete(sio_req_, &result);
+        if (!result.complete) {
+            // Partner armed but is not ready to finish — keep Start set.
+            // (Should not happen for ScriptedLinkPartner.)
+            uint16_t cnt = load_u16(&io_[IoReg::SIOCNT]);
+            store_u16(&io_[IoReg::SIOCNT],
+                      static_cast<uint16_t>(cnt | 0x0080u));
+            return;
+        }
+    } else {
+        // Solo Normal open-bus (identical to pre-link behavior).
+        result.complete = true;
+        result.rx_data = 0xFFFFFFFFu;
+    }
+    apply_sio_result(result);
 }
 
 uint32_t GbaIo::cycles_until_next_sio_event() const {
@@ -710,28 +806,16 @@ void GbaIo::write16(uint32_t off, uint16_t v) {
             store_u16(&io_[off], static_cast<uint16_t>(v & ~0x8800u));
             return;
         case IoReg::SIOCNT: {
-            // SIO control. In Normal mode with the internal shift clock
-            // (bit 0 = 1), writing the start/busy bit (bit 7) kicks a
-            // transfer; on completion the bit auto-clears and — if bit 14
-            // (IRQ enable) is set — the Serial IRQ fires. Games (e.g. the
-            // Minish Cap) re-arm it from the handler to get a periodic IRQ.
-            // External-clock (slave) transfers never complete without a
-            // partner, so we don't arm those. (GBATEK § "SIO Normal Mode".)
+            // SIO control. Start rising edge may arm a transfer depending on
+            // mode + partner (see try_arm_sio_transfer). Minish Cap re-arms
+            // Normal internal-clock from the Serial IRQ for a periodic tick.
+            // (GBATEK § "SIO Normal Mode" / § "SIO Multi-Player Mode".)
             uint16_t old = load_u16(&io_[off]);
             store_u16(&io_[off], v);
-            bool start_edge    = (old & 0x0080u) == 0 && (v & 0x0080u) != 0;
-            bool internal_clk  = (v & 0x0001u) != 0;
-            if (start_edge && internal_clk && !sio_transfer_active_) {
-                // Transfer duration: bit 1 = 2 MHz(1)/256 KHz(0) clock,
-                // bit 12 = 32-bit(1)/8-bit(0). Cycle table matches GBATEK /
-                // the cycle-accurate reference: {256K·8b, 2M·8b, 256K·32b,
-                // 2M·32b} = {512, 64, 2048, 256}.
-                static constexpr uint32_t kSioCycles[4] = {512u, 64u, 2048u,
-                                                           256u};
-                uint32_t idx = ((v >> 1) & 1u) | ((v >> 11) & 2u);
-                sio_cycles_remaining_ = kSioCycles[idx];
-                sio_transfer_active_  = true;
-            }
+            const bool start_edge =
+                (old & 0x0080u) == 0 && (v & 0x0080u) != 0;
+            if (start_edge && !sio_transfer_active_)
+                try_arm_sio_transfer(v);
             return;
         }
         default:

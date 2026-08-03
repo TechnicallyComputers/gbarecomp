@@ -19,6 +19,12 @@
 set(GBARECOMP_CORE_DIR "@CMAKE_CURRENT_SOURCE_DIR@" CACHE PATH "")
 set(GBARECOMP_CORE_BIN_DIR "@CMAKE_CURRENT_BINARY_DIR@" CACHE PATH "")
 
+# Delay-sync / link-cable netplay helper (lib/recomp-net submodule).
+# Games: gbarecomp_enable_recomp_net(<exe>) after add_executable.
+if(EXISTS "${GBARECOMP_CORE_DIR}/cmake/recomp_net.cmake")
+    include("${GBARECOMP_CORE_DIR}/cmake/recomp_net.cmake")
+endif()
+
 # Setup-host builds may configure before the user has run generate.
 option(GBARECOMP_ALLOW_NO_GENERATED
     "Allow gbarecomp_add_runtime_target without cart shards (setup host)"

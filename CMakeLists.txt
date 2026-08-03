@@ -213,6 +213,7 @@ add_library(gbarecomp_gba STATIC
     src/gba/gba_memory.cpp
     src/gba/gba_bus.cpp
     src/gba/gba_io.cpp
+    src/gba/gba_link.cpp
     src/gba/gba_irq.cpp
     src/gba/gba_dma.cpp
     src/gba/gba_timers.cpp
@@ -240,6 +241,11 @@ target_include_directories(gbarecomp_gba PUBLIC src/gba)
 target_include_directories(gbarecomp_gba PRIVATE src/debug)
 target_link_libraries(gbarecomp_gba PUBLIC gbarecomp_armv4t)
 set_property(TARGET gbarecomp_gba PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Optional recomp-net delay-sync (submodule lib/recomp-net, branch main).
+# Games call gbarecomp_enable_recomp_net(<target>), or configure with
+# -DGBARECOMP_ENABLE_NET=ON.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/recomp_net.cmake)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # heal_gate — P6 differential-gate primitives (snapshot/journal/diff). PURE:
@@ -619,6 +625,23 @@ add_test(NAME timer_tests COMMAND timer_tests)
 add_executable(gpio_tests tests/gpio/test_main.cpp)
 target_link_libraries(gpio_tests PRIVATE gbarecomp_gba)
 add_test(NAME gpio_tests COMMAND gpio_tests)
+
+add_executable(link_tests
+    tests/link/test_main.cpp
+    tests/link/runtime_stubs.cpp)
+target_link_libraries(link_tests PRIVATE gbarecomp_gba)
+add_test(NAME link_tests COMMAND link_tests)
+
+# Netplay smoke: requires lib/recomp-net submodule. Opt-in so default CI
+# without submodules still configures; enable with -DGBARECOMP_ENABLE_NET=ON
+# or when the submodule is present.
+if(EXISTS "${GBARECOMP_RECOMP_NET_ROOT}/CMakeLists.txt")
+    add_executable(netplay_smoke_tests
+        tests/netplay/test_main.cpp
+        tests/link/runtime_stubs.cpp)
+    gbarecomp_enable_recomp_net(netplay_smoke_tests)
+    add_test(NAME netplay_smoke_tests COMMAND netplay_smoke_tests)
+endif()
 
 add_executable(rtc_tests tests/rtc/test_main.cpp)
 target_link_libraries(rtc_tests PRIVATE gbarecomp_gba)
