@@ -112,8 +112,11 @@ def find_gba_recompile(project_root: pathlib.Path, gbarecomp_root: pathlib.Path)
         project_root,
         gbarecomp_root / "build",
         project_root / "build",
+        # Emerald/FRLG-style: add_subdirectory(gbarecomp gbarecomp_build)
+        project_root / "build" / "gbarecomp_build",
         gbarecomp_root / "build" / "Release",
         project_root / "build" / "Release",
+        project_root / "build" / "gbarecomp_build" / "Release",
         gbarecomp_root / "build" / "cli-release" / "core" / "Release",
     )
     for root in search_roots:

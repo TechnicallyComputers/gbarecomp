@@ -478,7 +478,15 @@ struct DeviceTickGuard {
     ~DeviceTickGuard() { g_in_device_tick = prev; }
 };
 
-static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
+// Advance devices for up to `cycles`. Returns any unconsumed remainder.
+//
+// When an IRQ becomes deliverable mid-flush (IME on, IE&IF, CPSR.I clear),
+// stop before further PPU/timer time elapses so runtime_tick can vector.
+// Without this, a lazy catch-up can complete Multi Serial and reach VBlank
+// in one flush; Emerald IntrMain runs LinkVSync before SerialCB, sees
+// serialIntrCounter < 9, and sets LAG_MASTER → CloseLink.
+static uint32_t tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu,
+                             uint32_t cycles) {
     DeviceTickGuard _dtg;
     // Stage 2: materializing device state can raise IF, advance the PPU phase,
     // run timed DMA into watched RAM, etc. Any of these can change a polled
@@ -496,6 +504,8 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
         if (until_sio < chunk) chunk = until_sio;
         if (until_ppu < chunk) chunk = until_ppu;
         if (chunk == 0) chunk = 1;
+
+        const uint16_t if_before = bus->io().if_reg();
 
         bus->audio().tick(chunk);
         bus->io().tick_timers(chunk);
@@ -545,7 +555,19 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
         }
 
         remaining -= chunk;
+
+        // Yield only on newly raised IE-masked IF bits. Using irq_pending()
+        // alone would freeze HALT-wake latency (IF already set) and stall
+        // IntrMain (CPSR.I set while IF is still latched).
+        const uint16_t newly =
+            static_cast<uint16_t>((bus->io().if_reg() & ~if_before) &
+                                 bus->io().ie());
+        if (newly != 0 && bus->io().ime() &&
+            (g_cpu.cpsr & CPSR_I_BIT) == 0) {
+            break;
+        }
     }
+    return remaining;
 }
 
 // ── LP-005 clock-event probe (env GBARECOMP_CYC_LO / GBARECOMP_CYC_HI) ───────
@@ -610,10 +632,10 @@ static inline void drain_dma_steal(gba::GbaBus* bus, gba::GbaPpu* ppu) {
         return;
     }
     if (g_pending_cycles) {
-        tick_devices(bus, ppu, static_cast<uint32_t>(g_pending_cycles));
-        g_pending_cycles = 0;
+        g_pending_cycles = tick_devices(
+            bus, ppu, static_cast<uint32_t>(g_pending_cycles));
     }
-    tick_devices(bus, ppu, cyc);
+    g_pending_cycles += tick_devices(bus, ppu, cyc);
     recompute_event_budget(bus, ppu);
 }
 
@@ -632,8 +654,8 @@ extern "C" void runtime_mmio_catch_up(void) {
     auto* bus = gbarecomp::g_active_bus;
     auto* ppu = gbarecomp::g_active_ppu;
     if (!bus || !ppu || g_pending_cycles == 0) return;
-    tick_devices(bus, ppu, static_cast<uint32_t>(g_pending_cycles));
-    g_pending_cycles = 0;
+    g_pending_cycles = tick_devices(
+        bus, ppu, static_cast<uint32_t>(g_pending_cycles));
 }
 
 // Recompute the next-event horizon after a config-changing MMIO write (timer
@@ -673,9 +695,14 @@ extern "C" void runtime_tick(uint32_t cycles) {
     g_pending_cycles += cycles;
     g_event_budget   -= static_cast<long long>(cycles);
     if (g_event_budget <= 0) {
-        tick_devices(bus, ppu, static_cast<uint32_t>(g_pending_cycles));
-        g_pending_cycles = 0;
-        recompute_event_budget(bus, ppu);
+        g_pending_cycles = tick_devices(
+            bus, ppu, static_cast<uint32_t>(g_pending_cycles));
+        // If we yielded with cycles still pending (deliverable IRQ), keep the
+        // budget exhausted so the next tick retries after the vector runs.
+        if (g_pending_cycles == 0)
+            recompute_event_budget(bus, ppu);
+        else
+            g_event_budget = 0;
     }
 
     // A timed/FIFO DMA may have fired inside that flush; charge its stolen bus
@@ -707,13 +734,17 @@ extern "C" void runtime_tick(uint32_t cycles) {
             // device ordering), then the wake-latency window, then re-arm the
             // horizon — all devices are now current as of this cycle.
             if (g_pending_cycles) {
-                tick_devices(bus, ppu, static_cast<uint32_t>(g_pending_cycles));
-                g_pending_cycles = 0;
+                g_pending_cycles = tick_devices(
+                    bus, ppu, static_cast<uint32_t>(g_pending_cycles));
             }
             cyc_probe("irq_wake", gba::kIrqWakeDelayCycles);
             g_runtime_cycles += gba::kIrqWakeDelayCycles;
-            tick_devices(bus, ppu, gba::kIrqWakeDelayCycles);
-            recompute_event_budget(bus, ppu);
+            g_pending_cycles +=
+                tick_devices(bus, ppu, gba::kIrqWakeDelayCycles);
+            if (g_pending_cycles == 0)
+                recompute_event_budget(bus, ppu);
+            else
+                g_event_budget = 0;
         }
         runtime_irq(g_cpu.R[15]);
     }

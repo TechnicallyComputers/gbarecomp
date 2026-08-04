@@ -28,6 +28,10 @@
 #include "gba_bus.h"
 #include "gba_ppu.h"
 #include "gba_rom_header.h"
+#if defined(GBARECOMP_NET)
+#include "gba_link.h"
+#include "gba_netplay.h"
+#endif
 #include "host_platform.h"
 #include "host_window.h"
 #include "runtime_arm.h"
@@ -1285,6 +1289,60 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     gba::GbaPpu ppu;
     bus.set_bios(&bios);
     bus.request_audio_shadow(args.audio_shadow);  // [audio].shadow default; env can override
+
+#if defined(GBARECOMP_NET)
+    // LAN delay-sync over the link-cable partner. Prefer launcher pending
+    // (recomp-ui Netplay → gba_netplay_set_pending); else GBA_NETPLAY* env.
+    gba::FrameLinkPartner net_link(/*unit_id=*/0);
+    bool netplay_on = false;
+    bool netplay_frame_admitted = false;
+    uint16_t netplay_last_keys = 0x03FFu;
+    GbaNetplayConfig ncfg{};
+    bool want_netplay = gba_netplay_take_pending(&ncfg) != 0;
+    if (!want_netplay) {
+        if (const char* en = std::getenv("GBA_NETPLAY");
+            en && en[0] && en[0] != '0') {
+            gba_netplay_config_defaults(&ncfg);
+            ncfg.enabled = 1;
+            if (const char* s = std::getenv("GBA_NETPLAY_SLOT"))
+                ncfg.local_slot = (s[0] == '1') ? 1 : 0;
+            if (const char* d = std::getenv("GBA_NETPLAY_DELAY")) {
+                const int v = std::atoi(d);
+                if (v >= 2 && v <= 20) ncfg.input_delay = v;
+            }
+            if (const char* b = std::getenv("GBA_NETPLAY_BIND"); b && b[0])
+                std::snprintf(ncfg.bind_hostport, sizeof(ncfg.bind_hostport),
+                              "%s", b);
+            if (const char* p = std::getenv("GBA_NETPLAY_PEER"); p && p[0])
+                std::snprintf(ncfg.peer_hostport, sizeof(ncfg.peer_hostport),
+                              "%s", p);
+            want_netplay = true;
+        }
+    }
+    if (want_netplay && ncfg.enabled) {
+        net_link.set_unit_id(
+            static_cast<uint8_t>(ncfg.local_slot ? 1 : 0));
+        bus.io().set_link_partner(&net_link);
+        gba_netplay_set_link_partner(&net_link);
+        if (gba_netplay_start_lan(&ncfg)) {
+            netplay_on = true;
+            std::fprintf(stderr,
+                "[gbarecomp:netplay] LAN delay-sync ON slot=%d delay=%d "
+                "bind=%s peer=%s\n",
+                ncfg.local_slot, ncfg.input_delay, ncfg.bind_hostport,
+                ncfg.peer_hostport[0] ? ncfg.peer_hostport : "(await)");
+            std::fprintf(stderr,
+                "[gbarecomp:link] handshake diag ON (1 Hz). "
+                "GBA_LINK_DEBUG=1 for verbose; watch multi/start/in/out "
+                "while waiting at Cable Club.\n");
+        } else {
+            std::fprintf(stderr,
+                "[gbarecomp:netplay] start_lan failed — continuing offline\n");
+            bus.io().set_link_partner(nullptr);
+            gba_netplay_set_link_partner(nullptr);
+        }
+    }
+#endif
 
     // BIOS backend select: LLE (recompiled BIOS, the default + oracle) vs HLE
     // (SWIs serviced in-runtime, unimplemented ones falling back to LLE).
@@ -2549,7 +2607,15 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     auto pump_host_input = [&]() {
         if (!args.window) return;
         auto ev = win.pump();
+#if defined(GBARECOMP_NET)
+        netplay_last_keys = ev.keyinput;
+        // While netplay is active, KEYINPUT is applied only after admit so
+        // both peers share the same pad sample for the locked tick.
+        if (!netplay_on && !input_replay_requested)
+            bus.io().set_keyinput(ev.keyinput);
+#else
         if (!input_replay_requested) bus.io().set_keyinput(ev.keyinput);
+#endif
         if (bus.gyro().active()) {
             // Mouse-drag is angular velocity, not absolute angle: moving while
             // held produces rotation and holding still returns to center.
@@ -2678,6 +2744,141 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // every frame). Returns true to request quit. TCP and frame-driven
     // input/replay paths leave the hook unset and keep the original
     // unwind-and-redispatch path.
+#if defined(GBARECOMP_NET)
+    // Delay-sync frame barrier: finish prior admitted tick, stage pad, admit
+    // next tick (publishes remote SIO into FrameLinkPartner), then apply pad.
+    // Returns false if the host requested quit while stalled.
+    const bool link_debug_verbose = []() {
+        if (const char* e = std::getenv("GBA_LINK_DEBUG");
+            e && e[0] && e[0] != '0')
+            return true;
+        return false;
+    }();
+    uint32_t link_diag_frames = 0;
+    uint32_t link_diag_last_multi_ok = 0;
+    // 0xFFFFFFFF = never logged; 0x0000 is a real peer word (post-handshake).
+    uint32_t link_diag_last_peer = 0xFFFFFFFFu;
+    auto netplay_link_diag = [&]() {
+        ++link_diag_frames;
+        const auto st = net_link.debug_stats();
+        if (st.multi_start_ok > 0 && link_diag_last_multi_ok == 0) {
+            std::fprintf(stderr,
+                "[gbarecomp:link] first Multi Start accepted "
+                "(slot=%d local_tx=0x%04X)\n",
+                net_link.unit_id(), st.last_local_tx);
+            link_diag_last_multi_ok = st.multi_start_ok;
+        } else if (st.multi_start_ok > link_diag_last_multi_ok) {
+            link_diag_last_multi_ok = st.multi_start_ok;
+        }
+        if (st.last_peer_rx != 0xFFFFu &&
+            st.last_peer_rx != static_cast<uint16_t>(link_diag_last_peer)) {
+            std::fprintf(stderr,
+                "[gbarecomp:link] peer Multi word seen: 0x%04X "
+                "(publish_ok=%u)\n",
+                st.last_peer_rx, st.publish_ok);
+            link_diag_last_peer = st.last_peer_rx;
+        }
+
+        const uint32_t period = link_debug_verbose ? 15u : 60u;
+        if ((link_diag_frames % period) != 0u) return;
+
+        const uint16_t siocnt = bus.io().read16(gba::IoReg::SIOCNT);
+        const uint16_t rcnt = bus.io().read16(gba::IoReg::RCNT);
+        const uint16_t send = bus.io().read16(gba::IoReg::SIOMLT_SEND);
+        const uint16_t m0 = bus.io().read16(gba::IoReg::SIOMULTI0);
+        const uint16_t m1 = bus.io().read16(gba::IoReg::SIOMULTI1);
+        const gba::SioMode mode = gba::sio_decode_mode(siocnt, rcnt);
+        const char* mode_s = "?";
+        switch (mode) {
+            case gba::SioMode::Normal8: mode_s = "N8"; break;
+            case gba::SioMode::Normal32: mode_s = "N32"; break;
+            case gba::SioMode::Multi: mode_s = "MULTI"; break;
+            case gba::SioMode::Uart: mode_s = "UART"; break;
+            case gba::SioMode::GeneralPurpose: mode_s = "GPIO"; break;
+            case gba::SioMode::Joybus: mode_s = "JOY"; break;
+        }
+        // Hint when Cable Club is waiting but nothing is moving.
+        const char* hint = "";
+        if (mode == gba::SioMode::Multi && (siocnt & 0x08u) == 0 &&
+            st.multi_start_ok == 0)
+            hint = " | HINT: Multi armed but SD=0 (cable sense not ready)";
+        else if (mode == gba::SioMode::Multi && st.multi_complete == 0 &&
+                 st.multi_start_ok == 0)
+            hint = " | HINT: Multi+SD ready but no Start/complete yet";
+        else if (st.multi_complete > 0 && st.last_publish_count == 0 &&
+                 st.publish_ok > 0)
+            hint = " | HINT: sending Multi but peer samples empty";
+        else if (st.multi_start_reject > 0 && st.slave_kick == 0 &&
+                 net_link.unit_id() != 0)
+            hint = " | HINT: child rejecting Start (no inbound parent word)";
+        else if (st.overflow_events > 0)
+            hint = " | HINT: outbound overflow ( >14 Multi/frame )";
+        else if (mode == gba::SioMode::Multi && st.multi_complete > 0 &&
+                 m1 == 0xFFFFu && net_link.unit_id() == 0)
+            hint = " | HINT: parent never sees child MULTI1 (handshake stall)";
+
+        std::fprintf(stderr,
+            "[gbarecomp:link] f=%u slot=%u mode=%s siocnt=%04X "
+            "SI=%u SD=%u id=%u start=%u send=%04X m0=%04X m1=%04X | "
+            "ok=%u rej=%u done=%u kick=%u pub=%u/%u samp=v%u/%u "
+            "tx=%04X rx=%04X latch=%04X/%04X ovf=%u inq=%zu%s\n",
+            link_diag_frames, static_cast<unsigned>(net_link.unit_id()),
+            mode_s, siocnt, (siocnt >> 2) & 1u, (siocnt >> 3) & 1u,
+            (siocnt >> 4) & 3u, (siocnt >> 7) & 1u, send, m0, m1,
+            st.multi_start_ok, st.multi_start_reject, st.multi_complete,
+            st.slave_kick, st.publish_ok, st.publish_fail,
+            st.last_sample_ver, st.last_sample_count, st.last_local_tx,
+            st.last_peer_rx, st.latched_multi[0], st.latched_multi[1],
+            st.overflow_events, net_link.inbound_count(), hint);
+    };
+
+    auto netplay_frame_barrier = [&]() -> bool {
+        if (!netplay_on) return true;
+        if (netplay_frame_admitted) {
+            gba_netplay_finish_frame();
+            netplay_frame_admitted = false;
+        }
+        gba_netplay_stage_keys(netplay_last_keys);
+        for (;;) {
+            if (host_quit) return false;
+            if (gba_netplay_peer_disconnected(5000u)) {
+                std::fprintf(stderr,
+                    "[gbarecomp:netplay] peer gone — returning to lobby\n");
+                gba_netplay_set_return_to_lobby(1);
+                gba_netplay_shutdown();
+                netplay_on = false;
+                bus.io().set_link_partner(nullptr);
+                gba_netplay_set_link_partner(nullptr);
+                host_quit = true;
+                return false;
+            }
+            if (!gba_netplay_is_running()) {
+                gba_netplay_pump();
+                if (args.window) {
+                    pump_host_input();
+                    win.present(live_fb.data());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            if (gba_netplay_poll_admit()) {
+                bus.io().set_keyinput(netplay_last_keys);
+                netplay_frame_admitted = true;
+                netplay_link_diag();
+                return true;
+            }
+            if (args.window) {
+                pump_host_input();
+                gba_netplay_stage_keys(netplay_last_keys);
+                win.present(live_fb.data());
+            } else {
+                gba_netplay_pump();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+#endif
+
     // Present-in-place is the default for windowed play (validated on busy-spin
     // games AND HALT-based Minish Cap). Escape hatch: GBARECOMP_PRESENT_IN_PLACE=0.
     // Stepped aside while the WIP widescreen sidecar is armed, since that path
@@ -2715,6 +2916,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 // here as well as in the outer loop so windowed repros exercise
                 // the same frame-indexed input as headless acceptance runs.
                 if (input_replay_requested) apply_input_replay();
+#if defined(GBARECOMP_NET)
+                if (!netplay_frame_barrier()) host_quit = true;
+#endif
                 const uint64_t fp_t4 = FramePhaseRing::now_ns();
                 last_presented_frame = frame;
                 ++frames_presented;
@@ -2980,6 +3184,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     uint64_t save_last_flush_frame = ppu.frame_count();
     if (input_replay_requested) apply_input_replay();
     if (args.window) pump_host_input();
+#if defined(GBARECOMP_NET)
+    // Admit tick 0 before the guest runs (PIP only barriers after a frame).
+    if (netplay_on && !netplay_frame_barrier()) host_quit = true;
+#endif
 
     for (int i = 0; i < step_budget && !host_quit; ++i) {
         // Paused: hold the guest still, keep the window alive (input pump,
@@ -3077,6 +3285,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 if (n > 0) win.push_audio_samples(audio_buf, n);
                 const uint64_t fp_t3 = FramePhaseRing::now_ns();
                 pump_host_input();
+#if defined(GBARECOMP_NET)
+                if (!netplay_frame_barrier()) host_quit = true;
+#endif
                 const uint64_t fp_t4 = FramePhaseRing::now_ns();
                 dispatches_since_pump = 0;
                 last_presented_frame = frame;
@@ -3232,6 +3443,19 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (scp[0]) ws_sidecar_dump(scp, g_ws_extra);
         }
     }
+
+#if defined(GBARECOMP_NET)
+    if (netplay_on) {
+        /* Local quit (window close) during a match → peer gets BYE and both
+         * soft-return to the lobby when the host used LAN netplay. */
+        if (host_quit) gba_netplay_set_return_to_lobby(1);
+        if (netplay_frame_admitted) gba_netplay_finish_frame();
+        gba_netplay_shutdown();
+        bus.io().set_link_partner(nullptr);
+        gba_netplay_set_link_partner(nullptr);
+        netplay_on = false;
+    }
+#endif
 
     gbarecomp::overlay_loader_shutdown();  // join worker + drain before banner
     emit_exit_diagnostics();

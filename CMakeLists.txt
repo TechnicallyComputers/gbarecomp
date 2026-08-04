@@ -348,6 +348,14 @@ target_compile_definitions(gbarecomp_runtime PRIVATE
 target_link_libraries(gbarecomp_runtime PUBLIC
     gbarecomp_gba gbarecomp_debug gbarecomp_recompile_core
     gbarecomp_heal_gate)
+# Delay-sync / link-cable: compile runtime barrier when netplay is enabled.
+if(GBARECOMP_ENABLE_NET)
+    _gbarecomp_add_netplay_lib()
+    target_link_libraries(gbarecomp_runtime PUBLIC gbarecomp_netplay)
+    target_compile_definitions(gbarecomp_runtime PUBLIC GBARECOMP_NET=1)
+    message(STATUS
+        "gbarecomp: runtime frame barrier linked (GBARECOMP_ENABLE_NET)")
+endif()
 set_property(TARGET gbarecomp_runtime PROPERTY POSITION_INDEPENDENT_CODE ON)
 if(GBARECOMP_SDL2_OK)
     target_compile_definitions(gbarecomp_runtime PUBLIC GBARECOMP_HAVE_SDL2)

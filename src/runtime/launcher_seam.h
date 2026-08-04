@@ -44,6 +44,10 @@
 
 #include "recomp_launcher.h"    // recomp-ui C ABI (include dir via recomp_ui.cmake)
 #include "launcher_profile.h"   // launcher_profile_apply("gba", ...)
+#if defined(GBARECOMP_NET) && defined(GBARECOMP_NET_LOBBY)
+#include "gba_host_lobby.h"
+#include "gba_netplay.h"
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -590,7 +594,31 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
     }
 }
 
+#if defined(GBARECOMP_NET) && defined(GBARECOMP_NET_LOBBY)
+inline int& resume_netplay_flag() {
+    static int v = 0;
+    return v;
+}
+#endif
+
 }  // namespace gbarecomp_seam
+
+#if defined(GBARECOMP_NET) && defined(GBARECOMP_NET_LOBBY)
+/* Arm soft-return: next preboot opens Netplay with the waiting room. */
+inline void gbarecomp_launcher_set_resume_netplay(int on) {
+    gbarecomp_seam::resume_netplay_flag() = on ? 1 : 0;
+}
+
+/* After run_game(): if a LAN match requested soft-return, prepare rematch and
+ * arm resume. Returns 1 when main should re-enter the launcher. */
+inline int gbarecomp_launcher_should_soft_return(void) {
+    if (!gba_netplay_consume_return_to_lobby()) return 0;
+    if (!gba_host_lobby_in_lan()) return 0;
+    gba_host_lobby_prepare_rematch();
+    gbarecomp_launcher_set_resume_netplay(1);
+    return 1;
+}
+#endif
 
 // Run the pre-boot launcher. Returns 1 if the user quit (caller returns 0
 // from main without booting), 0 to continue into run_game() — with `args`
@@ -798,6 +826,41 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     if (opts.launcher_codegen_setup)
         opts.launcher_codegen_setup(&gi);
 
+#if defined(GBARECOMP_NET) && defined(GBARECOMP_NET_LOBBY)
+    // LAN link-cable netplay lobby (recomp-ui Netplay view). Online MotK is
+    // stubbed; use Host Lobby → LAN/Direct IP Only.
+    // Keep num_players=1 (one pad card); lobby seats come from lobby_max_slots.
+    {
+        static int s_lobby_inited = 0;
+        if (!s_lobby_inited) {
+            GbaHostLobbyIdentity id{};
+            id.game_name = (opts.builtin_game_name && opts.builtin_game_name[0])
+                               ? opts.builtin_game_name
+                               : gi.name;
+            id.game_version = "0.1.0";
+            id.lan_registry_path = "netplay_lan_lobby.txt";
+            id.default_lobby_name = "LAN Lobby";
+            if (gba_host_lobby_init(&id) == 0) s_lobby_inited = 1;
+        }
+        if (s_lobby_inited) {
+            gi.num_players = 1;
+            gi.netplay_supported = 1;
+            gi.netplay = gba_host_lobby_callbacks();
+            if (ls.netplay_player_name[0] && gi.netplay &&
+                gi.netplay->set_player_name) {
+                gi.netplay->set_player_name(gi.netplay->ctx,
+                                            ls.netplay_player_name);
+            }
+            if (gbarecomp_seam::resume_netplay_flag() &&
+                gba_host_lobby_in_lan()) {
+                gi.resume_netplay_room = 1;
+                gi.resume_netplay_endpoint = gba_host_lobby_resume_endpoint();
+            }
+            gbarecomp_seam::resume_netplay_flag() = 0;
+        }
+    }
+#endif
+
     std::string title = std::string(gi.name) + " \xE2\x80\x94 Launcher";
 
     char picked_rom[1024] = {0};
@@ -893,6 +956,28 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         write_single_line(bios_cfg, ls.bios_path);
     }
     seam_append_setting_args(args, cfg, opts);
+
+#if defined(GBARECOMP_NET) && defined(GBARECOMP_NET_LOBBY)
+    if (ls.netplay_launch.enabled) {
+        GbaNetplayConfig ncfg{};
+        gba_netplay_config_defaults(&ncfg);
+        ncfg.enabled = 1;
+        ncfg.local_slot = ls.netplay_launch.local_slot ? 1 : 0;
+        ncfg.session_id =
+            ls.netplay_launch.session_id ? ls.netplay_launch.session_id : 1u;
+        ncfg.input_delay = ls.netplay_launch.input_delay;
+        if (ncfg.input_delay < 2) ncfg.input_delay = 2;
+        if (ncfg.input_delay > 20) ncfg.input_delay = 20;
+        std::snprintf(ncfg.bind_hostport, sizeof(ncfg.bind_hostport), "%s",
+                      ls.netplay_launch.bind_hostport);
+        std::snprintf(ncfg.peer_hostport, sizeof(ncfg.peer_hostport), "%s",
+                      ls.netplay_launch.peer_hostport);
+        gba_netplay_set_pending(&ncfg);
+    } else if (gba_host_lobby_in_lan()) {
+        /* Offline Play after soft-return — leave the waiting room. */
+        (void)gba_host_lobby_leave();
+    }
+#endif
     return 0;
 }
 

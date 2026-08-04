@@ -27,6 +27,17 @@ typedef struct GbaNetplayConfig {
 
 void gba_netplay_config_defaults(GbaNetplayConfig* cfg);
 
+/* Launcher → runtime handoff: set before run_game(); consumed once at boot
+ * (takes priority over GBA_NETPLAY* env). */
+void gba_netplay_set_pending(const GbaNetplayConfig* cfg);
+int  gba_netplay_take_pending(GbaNetplayConfig* out); /* 1 if pending taken */
+
+/* Soft-return: runtime sets this when a netplay match should reopen the lobby
+ * (local quit or peer BYE). Host consumes after run_game() returns. */
+void gba_netplay_set_return_to_lobby(int enabled);
+int  gba_netplay_return_to_lobby_requested(void);
+int  gba_netplay_consume_return_to_lobby(void); /* 1 if was set; clears */
+
 /* Attach the FrameLinkPartner already wired into GbaIo (not owned). */
 #ifdef __cplusplus
 namespace gba { class FrameLinkPartner; }
@@ -48,8 +59,9 @@ void gba_netplay_stage_keys(uint16_t keys);
 
 void gba_netplay_pump(void);
 
-/* Call FrameLinkPartner::begin_frame, then pump + try_admit.
- * On success, remote SIO events are already published into the partner. */
+/* Pump + try_admit. On success, remote SIO events are published into the
+ * partner and begin_frame() has cleared outbound for the upcoming sim tick.
+ * sample_local (inside try_admit) still sees the previous frame's outbound. */
 int  gba_netplay_poll_admit(void);
 
 /* Call after one admitted sim frame. */

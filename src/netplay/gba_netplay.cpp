@@ -24,6 +24,9 @@ struct GbaNetplayState {
 };
 
 GbaNetplayState g_np;
+GbaNetplayConfig g_pending{};
+int g_pending_valid = 0;
+int g_return_to_lobby = 0;
 
 void sample_local(rnet_u32 /*tick*/, RNetInputSample* out, void* /*ctx*/) {
     if (!out) return;
@@ -63,6 +66,39 @@ extern "C" void gba_netplay_config_defaults(GbaNetplayConfig* cfg) {
     cfg->input_delay = 2;
     cfg->session_id = 1;
     std::snprintf(cfg->bind_hostport, sizeof(cfg->bind_hostport), ":41000");
+}
+
+extern "C" void gba_netplay_set_pending(const GbaNetplayConfig* cfg) {
+    if (!cfg || !cfg->enabled) {
+        g_pending_valid = 0;
+        std::memset(&g_pending, 0, sizeof(g_pending));
+        return;
+    }
+    g_pending = *cfg;
+    g_pending.enabled = 1;
+    g_pending_valid = 1;
+}
+
+extern "C" int gba_netplay_take_pending(GbaNetplayConfig* out) {
+    if (!g_pending_valid || !out) return 0;
+    *out = g_pending;
+    g_pending_valid = 0;
+    std::memset(&g_pending, 0, sizeof(g_pending));
+    return 1;
+}
+
+extern "C" void gba_netplay_set_return_to_lobby(int enabled) {
+    g_return_to_lobby = enabled ? 1 : 0;
+}
+
+extern "C" int gba_netplay_return_to_lobby_requested(void) {
+    return g_return_to_lobby;
+}
+
+extern "C" int gba_netplay_consume_return_to_lobby(void) {
+    const int v = g_return_to_lobby;
+    g_return_to_lobby = 0;
+    return v;
 }
 
 extern "C" void gba_netplay_set_link_partner(gba::FrameLinkPartner* partner) {
@@ -137,11 +173,15 @@ extern "C" void gba_netplay_pump(void) {
 
 extern "C" int gba_netplay_poll_admit(void) {
     if (!g_np.session) return 0;
-    if (g_np.link) g_np.link->begin_frame();
     rnet_session_pump(g_np.session);
     if (!rnet_session_is_running(g_np.session)) return 0;
     const rnet_u32 t = rnet_session_sim_tick(g_np.session);
-    return rnet_session_try_admit(g_np.session, t);
+    // sample_local runs inside try_admit and must see outbound from the
+    // previous sim frame. begin_frame() clears that queue — call it only
+    // after a successful admit, before the next frame's SIO transfers.
+    if (!rnet_session_try_admit(g_np.session, t)) return 0;
+    if (g_np.link) g_np.link->begin_frame();
+    return 1;
 }
 
 extern "C" void gba_netplay_finish_frame(void) {

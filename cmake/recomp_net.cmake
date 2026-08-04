@@ -78,12 +78,24 @@ function(_gbarecomp_add_netplay_lib)
     endif()
 
     add_library(gbarecomp_netplay STATIC
-        "${GBARECOMP_ROOT_DIR}/src/netplay/gba_netplay.cpp")
+        "${GBARECOMP_ROOT_DIR}/src/netplay/gba_netplay.cpp"
+        "${GBARECOMP_ROOT_DIR}/src/netplay/gba_host_lobby.c")
     target_include_directories(gbarecomp_netplay PUBLIC
         "${GBARECOMP_ROOT_DIR}/src/netplay"
         "${GBARECOMP_ROOT_DIR}/src/gba")
     target_link_libraries(gbarecomp_netplay PUBLIC recomp_net gbarecomp_gba)
     target_compile_definitions(gbarecomp_netplay PUBLIC GBARECOMP_NET=1)
+    # Lobby callbacks need recomp-ui's C ABI when the game builds with the
+    # launcher. GBARECOMP_RUNTIME_UI_ROOT is set by game CMakeLists.
+    if(DEFINED GBARECOMP_RUNTIME_UI_ROOT AND
+       EXISTS "${GBARECOMP_RUNTIME_UI_ROOT}/src/recomp_launcher.h")
+        target_include_directories(gbarecomp_netplay PRIVATE
+            "${GBARECOMP_RUNTIME_UI_ROOT}/src")
+        target_compile_definitions(gbarecomp_netplay PRIVATE
+            GBARECOMP_HAS_RECOMP_UI=1)
+        target_compile_definitions(gbarecomp_netplay PUBLIC
+            GBARECOMP_NET_LOBBY=1)
+    endif()
     set_property(TARGET gbarecomp_netplay PROPERTY POSITION_INDEPENDENT_CODE ON)
 endfunction()
 

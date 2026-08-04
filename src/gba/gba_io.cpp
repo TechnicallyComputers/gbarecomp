@@ -565,7 +565,14 @@ void GbaIo::try_arm_sio_transfer(uint16_t siocnt) {
         if (!link_) return;
 
         uint32_t cycles = sio_multi_transfer_cycles(siocnt);
-        if (!link_->on_transfer_start(req, &cycles)) return;
+        if (!link_->on_transfer_start(req, &cycles)) {
+            // Handshake pacing (or child with empty inbound) refused this
+            // Start. Clear Busy so Timer3 / the guest can retry later —
+            // leaving Start stuck wedges the Cable Club state machine.
+            store_u16(&io_[IoReg::SIOCNT],
+                      static_cast<uint16_t>(siocnt & ~0x0080u));
+            return;
+        }
         sio_req_ = req;
         sio_cycles_remaining_ = cycles;
         sio_transfer_active_ = true;
@@ -577,31 +584,65 @@ void GbaIo::try_arm_sio_transfer(uint16_t siocnt) {
 }
 
 void GbaIo::tick_sio(uint32_t cycles) {
-    if (!sio_transfer_active_) return;
-    if (cycles < sio_cycles_remaining_) {
-        sio_cycles_remaining_ -= cycles;
-        return;
-    }
-    sio_transfer_active_  = false;
-    sio_cycles_remaining_ = 0;
+    // Normal mode may complete several rounds in one call. Multi must not:
+    // Emerald's SerialCB (DoHandshake / DoRecv) expects one SIOMULTI snapshot
+    // per Serial IRQ. Burst-completing a delay-sync inbound queue here races
+    // ahead of IntrMain and leaves only the last word (often 0x0000) visible.
+    uint32_t left = cycles;
+    for (;;) {
+        // Child Multi seat: parent Start is visible via published inbound.
+        // HW makes SIOCNT.Start read-only for children — kick a transfer here.
+        // Hold kicks while IF.Serial is still latched so the guest can ACK and
+        // run SerialCB before the next cable word overwrites SIOMULTI.
+        if (!sio_transfer_active_ && link_) {
+            const bool serial_if =
+                (load_u16(&io_[IoReg::IF]) & IrqSerial) != 0;
+            if (!serial_if) {
+                uint32_t kick_cycles = 0;
+                if (link_->poll_multi_slave_start(&kick_cycles)) {
+                    const uint16_t siocnt = load_u16(&io_[IoReg::SIOCNT]);
+                    const uint16_t rcnt = load_u16(&io_[IoReg::RCNT]);
+                    if (sio_decode_mode(siocnt, rcnt) == SioMode::Multi) {
+                        const uint16_t with_start =
+                            static_cast<uint16_t>(siocnt | 0x0080u);
+                        store_u16(&io_[IoReg::SIOCNT], with_start);
+                        try_arm_sio_transfer(with_start);
+                        if (sio_transfer_active_ && kick_cycles)
+                            sio_cycles_remaining_ = kick_cycles;
+                    }
+                }
+            }
+        }
 
-    SioTransferResult result{};
-    if (link_) {
-        link_->on_transfer_complete(sio_req_, &result);
-        if (!result.complete) {
-            // Partner armed but is not ready to finish — keep Start set.
-            // (Should not happen for ScriptedLinkPartner.)
-            uint16_t cnt = load_u16(&io_[IoReg::SIOCNT]);
-            store_u16(&io_[IoReg::SIOCNT],
-                      static_cast<uint16_t>(cnt | 0x0080u));
+        if (!sio_transfer_active_) return;
+        if (left < sio_cycles_remaining_) {
+            sio_cycles_remaining_ -= left;
             return;
         }
-    } else {
-        // Solo Normal open-bus (identical to pre-link behavior).
-        result.complete = true;
-        result.rx_data = 0xFFFFFFFFu;
+        left -= sio_cycles_remaining_;
+        sio_transfer_active_  = false;
+        sio_cycles_remaining_ = 0;
+
+        SioTransferResult result{};
+        if (link_) {
+            link_->on_transfer_complete(sio_req_, &result);
+            if (!result.complete) {
+                // Partner armed but is not ready to finish — keep Start set.
+                uint16_t cnt = load_u16(&io_[IoReg::SIOCNT]);
+                store_u16(&io_[IoReg::SIOCNT],
+                          static_cast<uint16_t>(cnt | 0x0080u));
+                return;
+            }
+        } else {
+            result.complete = true;
+            result.rx_data = 0xFFFFFFFFu;
+        }
+        const SioMode done_mode = sio_req_.mode;
+        apply_sio_result(result);
+        if (done_mode == SioMode::Multi)
+            return;
+        // Continue with leftover cycles for Normal bursts only.
     }
-    apply_sio_result(result);
 }
 
 uint32_t GbaIo::cycles_until_next_sio_event() const {
@@ -697,6 +738,26 @@ uint16_t GbaIo::read16(uint32_t off) {
         uint16_t target = (base >> 8) & 0xFFu;
         if (ppu_->vcount() == target) flags |= 0x0004u;
         return static_cast<uint16_t>((base & 0xFFF8u) | flags);
+    }
+    if (off == IoReg::SIOCNT && link_) {
+        // GBATEK Multi-Player: SI/SD are live cable-sense terminals. Games
+        // (e.g. Emerald Cable Club) poll SD=ready and SI=parent|child before
+        // the parent ever writes Start — so they cannot wait for
+        // apply_sio_result. Overlay partner sense; leave ID/Error as last
+        // transfer-owned values in the backing store.
+        const uint16_t base = load_u16(&io_[off]);
+        const uint16_t rcnt = load_u16(&io_[IoReg::RCNT]);
+        if (sio_decode_mode(base, rcnt) == SioMode::Multi) {
+            bool is_child = false;
+            bool all_ready = false;
+            if (link_->multi_cable_sense(&is_child, &all_ready)) {
+                uint16_t v = static_cast<uint16_t>(base & ~0x000Cu);
+                if (is_child) v = static_cast<uint16_t>(v | 0x0004u);
+                if (all_ready) v = static_cast<uint16_t>(v | 0x0008u);
+                return v;
+            }
+        }
+        return base;
     }
     if (off >= 0x100u && off <= 0x10Cu && ((off - 0x100u) % 4u) == 0) {
         int timer = static_cast<int>((off - 0x100u) / 4u);
